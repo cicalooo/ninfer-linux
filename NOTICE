@@ -1,0 +1,14 @@
+This repository redistributes a prebuilt Linux binary of NInfer-all.
+
+Upstream: https://github.com/iamwavecut/ninfer-all
+Commit:   8319e8f
+License:  Apache License 2.0 (see LICENSE)
+
+NInfer-all consolidates Neroued/ninfer, Don-Chad/ninfer-3090, and other
+forks. Credit for the engine belongs to those authors and the contributors
+listed at:
+
+  https://github.com/iamwavecut/ninfer-all/blob/master/CONTRIBUTORS.md
+
+This redistribution adds packaging, an install script, and GitHub Releases.
+It does not claim authorship of the engine.

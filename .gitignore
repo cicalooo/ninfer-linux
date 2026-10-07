@@ -1,0 +1,4 @@
+*.tar.gz
+*.tar
+SHA256SUMS.txt
+/dist/
