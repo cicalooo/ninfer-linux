@@ -2,7 +2,7 @@
 
 Prebuilt **Linux x64** [NInfer-all](https://github.com/iamwavecut/ninfer-all) CLI for people who do not want to compile CUDA kernels.
 
-This is a redistribution of upstream `ninfer-all` at commit [`8319e8f`](https://github.com/iamwavecut/ninfer-all/commit/8319e8f). It is **not** ComfyUI-specific. Use it from a shell, as a server, or from any frontend that can spawn `ninfer`.
+This is a redistribution of upstream `ninfer-all` at commit [`e7b7e66`](https://github.com/iamwavecut/ninfer-all/commit/e7b7e669c47703d2c0489e4a01c5ef4dd0f87f81) (master, 2026-10-13; `ninfer --version` prints `0.12.0-rtx3090+e7b7e66`). It is **not** ComfyUI-specific. Use it from a shell, as a server, or from any frontend that can spawn `ninfer`.
 
 ## Hardware
 
@@ -28,7 +28,7 @@ Default prefix is `/opt/ninfer`. Override it:
 curl -fsSL https://github.com/cicalooo/ninfer-linux/releases/latest/download/install.sh | bash -s -- --prefix "$HOME/.local/ninfer"
 ```
 
-The script checks the tarball SHA-256, unpacks `ninfer`, `ninfer-serve`, `ninfer-calibrate`, and `ninfer-perplexity` (one multicall binary), and runs `ninfer --help`.
+The script checks the tarball SHA-256, unpacks `ninfer`, `ninfer-serve`, `ninfer-calibrate`, `ninfer-perplexity`, and `ninfer-ngram-profile` (one multicall binary), and runs `ninfer --help`.
 
 ### Runtime libraries
 
@@ -71,16 +71,27 @@ Optional flags that this build advertises: `--spec mtp|dflash|dflash2`, `--kv-dt
 
 ## Rebuild (this tree)
 
-The published sm_86 binary was compiled on an RTX 3090 (Arch, CUDA 13.4, GCC 15):
+The published sm_86 binary was compiled on an RTX 3090 host (Arch, CUDA 13.4.92, GCC 15) following
+upstream `docs/build-linux.md`, with the multicall option. It took about 48 minutes with `--parallel 8`
+on an i9-10850K.
 
 ```bash
-git clone --depth 1 https://github.com/iamwavecut/ninfer-all.git
-export NINFER_CUDA_PATH=/opt/cuda NINFER_CUDA_ARCH=86 NINFER_TESTS=OFF NINFER_MULTICALL=ON
-export CC=/usr/bin/gcc-15 CXX=/usr/bin/g++-15 CUDAHOSTCXX=/usr/bin/g++-15
-cd ninfer-all
-scripts/build-native.sh configure
-scripts/build-native.sh target ninfer-multicall
+git clone https://github.com/iamwavecut/ninfer-all.git && cd ninfer-all
+git checkout e7b7e669c47703d2c0489e4a01c5ef4dd0f87f81
+export CC=/usr/bin/gcc-15 CXX=/usr/bin/g++-15 CUDACXX=/opt/cuda/bin/nvcc CUDAHOSTCXX=/usr/bin/g++-15
+cmake -S . -B build-sm86 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX -DCMAKE_CUDA_COMPILER=$CUDACXX \
+  -DCMAKE_CUDA_HOST_COMPILER=$CUDAHOSTCXX -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DNINFER_BUILD_APPS=ON -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=OFF -DNINFER_MULTICALL=ON
+cmake --build build-sm86 --parallel 8
 ```
+
+Since `8319e8f` this line adds, among others:
+- Gemma 4 vision (from `877fe16e`)
+- Qwen3.8-Flash-Next MTP (from `5395ec30b`)
+- the Q8_0 hyper-connection format that current Flash-Next artifacts need (from `944811b5c`)
+- `--version`
+- the `ninfer-ngram-profile` tool
 
 ## License
 
