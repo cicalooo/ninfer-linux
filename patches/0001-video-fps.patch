@@ -1,0 +1,233 @@
+From f009850b91cb47facb0292671500f5a94126e661 Mon Sep 17 00:00:00 2001
+From: cicalooo <153059103+cicalooo@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 18:58:42 +1100
+Subject: [PATCH] feat: add --video-fps override after the artifact 2 fps check
+
+Keep the Qwen video preprocessor locked at 2 fps in the artifact.
+A process-level 1..8 override samples at another rate without rewriting
+video_preprocessor_config.json. Default 2 leaves sampling unchanged.
+---
+ apps/cli/main.cpp                        |  1 +
+ apps/cli/options.cpp                     |  8 ++++++++
+ apps/cli/options.h                       |  1 +
+ include/ninfer/types.h                   |  3 +++
+ src/models/qwen3_5/frontend/frontend.cpp |  4 ++++
+ src/models/qwen3_5/frontend/frontend.h   |  2 ++
+ src/runtime/engine/model_instance.cpp    |  1 +
+ src/serve/generation_service.cpp         |  1 +
+ src/serve/serve_options.cpp              | 11 +++++++++++
+ src/serve/serve_options.h                |  1 +
+ tests/test_cli_options.cpp               | 16 ++++++++++++++++
+ tests/test_serve_options.cpp             | 12 ++++++++++++
+ 12 files changed, 61 insertions(+)
+
+diff --git a/apps/cli/main.cpp b/apps/cli/main.cpp
+index b31ebef..f185b93 100644
+--- a/apps/cli/main.cpp
++++ b/apps/cli/main.cpp
+@@ -380,6 +380,7 @@ int main(int argc, char** argv) {
+         engine_options.enable_vision            = cli.enable_vision;
+         engine_options.vision_residency         = cli.vision_residency;
+         engine_options.vision_max_merged_tokens = cli.vision_max_merged_tokens;
++        engine_options.video_fps                = cli.video_fps;
+         engine_options.use_cuda_graph           = cli.use_cuda_graph;
+         engine_options.lm_head_q4               = cli.lm_head_q4;
+         engine_options.lm_head_q6               = cli.lm_head_q6;
+diff --git a/apps/cli/options.cpp b/apps/cli/options.cpp
+index ce79a91..87f214e 100644
+--- a/apps/cli/options.cpp
++++ b/apps/cli/options.cpp
+@@ -297,6 +297,9 @@ std::string usage_text(const char* argv0) {
+            "  --vision-cpu                  --vision with --vision-residency cpu\n"
+            "  --vision-max-merged N         merged tokens of one media item (default 16384);\n"
+            "                                larger media is downscaled\n"
++           "  --video-fps N                 sample video at N frames per second (1..8,\n"
++           "                                default 2). The artifact must still declare 2.\n"
++           "                                Higher rates cost vision tokens and VRAM.\n"
+            "\n"
+            "LOGGING\n"
+            "  --log-level L                 trace, debug, info (default), warning, error,\n"
+@@ -504,6 +507,11 @@ Options parse_options(int argc, char** argv) {
+             if (options.vision_max_merged_tokens < 64 || options.vision_max_merged_tokens > 16384) {
+                 throw std::invalid_argument("--vision-max-merged must be in [64, 16384]");
+             }
++        } else if (arg == "--video-fps") {
++            options.video_fps = parse_u32(value(arg), "video-fps");
++            if (options.video_fps < 1.0 || options.video_fps > 8.0) {
++                throw std::invalid_argument("--video-fps must be in [1, 8]");
++            }
+         } else if (arg == "--no-cuda-graph") {
+             options.use_cuda_graph = false;
+         } else if (arg == "--stop-token-id") {
+diff --git a/apps/cli/options.h b/apps/cli/options.h
+index 41e2ec8..c45c7da 100644
+--- a/apps/cli/options.h
++++ b/apps/cli/options.h
+@@ -41,6 +41,7 @@ struct Options {
+     bool enable_vision  = false;
+     VisionResidency vision_residency       = VisionResidency::Resident;
+     std::uint32_t vision_max_merged_tokens = 16384;
++    double video_fps                       = 2.0;
+     bool use_cuda_graph = true;
+     bool lm_head_q4     = false;
+     bool lm_head_q6     = false;
+diff --git a/include/ninfer/types.h b/include/ninfer/types.h
+index 41b4149..7eb28f0 100644
+--- a/include/ninfer/types.h
++++ b/include/ninfer/types.h
+@@ -669,6 +669,9 @@ struct EngineOptions {
+     // Largest merged-token count one media item may occupy; larger media is downscaled at
+     // preprocessing. Also bounds the overlay window.
+     std::uint32_t vision_max_merged_tokens = 16384;
++    // Qwen video sample rate after the artifact's fps=2 check. 2 is the trained default
++    // and leaves sampling unchanged. 1..8.
++    double video_fps = 2.0;
+     bool use_cuda_graph                    = true;
+     // Explicit total CUDA Graph driver-state allowance in bytes; zero keeps the
+     // computed per-profile allowance.
+diff --git a/src/models/qwen3_5/frontend/frontend.cpp b/src/models/qwen3_5/frontend/frontend.cpp
+index 36b9b7d..439eeed 100644
+--- a/src/models/qwen3_5/frontend/frontend.cpp
++++ b/src/models/qwen3_5/frontend/frontend.cpp
+@@ -887,6 +887,10 @@ public:
+             g.video_tokens = std::min(g.video_tokens, g.max_tokens);
+         } else {
+             fi::bound_merged_tokens(processor, options.vision_max_merged_tokens);
++            if (options.video_fps < 1.0 || options.video_fps > 8.0) {
++                throw std::invalid_argument("video_fps must be in [1, 8]");
++            }
++            processor.video_fps = options.video_fps;
+         }
+         if (options.max_context == 0) {
+             throw std::invalid_argument("frontend max_context must be nonzero");
+diff --git a/src/models/qwen3_5/frontend/frontend.h b/src/models/qwen3_5/frontend/frontend.h
+index 8584a84..608a3ff 100644
+--- a/src/models/qwen3_5/frontend/frontend.h
++++ b/src/models/qwen3_5/frontend/frontend.h
+@@ -31,6 +31,8 @@ struct FrontendOptions {
+     // Largest merged-token count one media item may occupy; larger media is downscaled at
+     // preprocessing instead of being rejected. Zero leaves the artifact's pixel ceilings.
+     std::uint32_t vision_max_merged_tokens = 16384;
++    // Per-process Qwen video sample rate. Applied after the artifact's fps=2 check. 1..8.
++    double video_fps = 2.0;
+     // End-of-thinking message injected when a request hits its thinking budget. Empty
+     // preserves the built-in canonical control suffix; a message lacking the canonical
+     // </think> close serialization gets it appended at startup.
+diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
+index ef20107..a00d0ed 100644
+--- a/src/runtime/engine/model_instance.cpp
++++ b/src/runtime/engine/model_instance.cpp
+@@ -430,6 +430,7 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
+            .media_live_bytes         = options.media_live_bytes,
+            .media_preprocess_threads = options.media_preprocess_threads,
+            .vision_max_merged_tokens = options.vision_max_merged_tokens,
++           .video_fps                = options.video_fps,
+            .thinking_budget_message  = options.thinking_budget_message,
+            .ngram_sources_enabled    = options.speculative.ngram_draft_tokens != 0,
+            .ngram_archive_enabled    = options.speculative.ngram_archive_bytes != 0,
+diff --git a/src/serve/generation_service.cpp b/src/serve/generation_service.cpp
+index 5c6c002..8625cce 100644
+--- a/src/serve/generation_service.cpp
++++ b/src/serve/generation_service.cpp
+@@ -276,6 +276,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
+     engine_options.grafts                   = options.grafts;
+     engine_options.vision_residency         = options.vision_residency;
+     engine_options.vision_max_merged_tokens = options.vision_max_merged_tokens;
++    engine_options.video_fps                = options.video_fps;
+     engine_options.use_cuda_graph           = options.use_cuda_graph;
+     engine_options.lm_head_q4               = options.lm_head_q4;
+     engine_options.lm_head_q6               = options.lm_head_q6;
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+index 01d9297..616b50e 100644
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -368,6 +368,9 @@ std::string serve_usage_text(const char* argv0) {
+            "  --vision-cpu                  --vision with --vision-residency cpu\n"
+            "  --vision-max-merged N         merged tokens of one media item, 64..16384\n"
+            "                                (default 16384); larger media is downscaled\n"
++           "  --video-fps N                 sample video at N frames per second (1..8,\n"
++           "                                default 2). The artifact must still declare 2.\n"
++           "                                Higher rates cost vision tokens and VRAM.\n"
+            "  --media-cache-mib N           retained prepared media (default 1024; 0\n"
+            "                                disables)\n"
+            "  --media-live-mib N            all live prepared media payloads (default 2048)\n"
+@@ -1182,6 +1185,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+             vision_max_merged_explicit       = true;
+             continue;
+         }
++        if (arg == "--video-fps") {
++            const std::uint64_t fps = parse_u64(require_value("--video-fps"), "video-fps");
++            if (fps < 1 || fps > 8) {
++                throw std::invalid_argument("--video-fps must be in [1, 8]");
++            }
++            options.video_fps = static_cast<double>(fps);
++            continue;
++        }
+         if (arg == "--no-cuda-graph") {
+             options.use_cuda_graph = false;
+             continue;
+diff --git a/src/serve/serve_options.h b/src/serve/serve_options.h
+index a9e91d9..d05a89c 100644
+--- a/src/serve/serve_options.h
++++ b/src/serve/serve_options.h
+@@ -80,6 +80,7 @@ struct ServeOptions {
+     bool enable_vision      = false;
+     VisionResidency vision_residency       = VisionResidency::Resident;
+     std::uint32_t vision_max_merged_tokens = 16384;
++    double video_fps                       = 2.0;
+     bool use_cuda_graph     = true;
+     bool lm_head_q4         = false;
+     bool lm_head_q6         = false;
+diff --git a/tests/test_cli_options.cpp b/tests/test_cli_options.cpp
+index 6fe1168..18ad3dc 100644
+--- a/tests/test_cli_options.cpp
++++ b/tests/test_cli_options.cpp
+@@ -217,6 +217,22 @@ int run_tests() {
+     failures += check(k8v4.kv_cache == ninfer::KvCacheStorage::Fp8KeyNvfp4Value,
+                       "--kv-dtype k8v4 did not select asymmetric K8V4 KV");
+     const std::string help = ninfer::cli::usage_text("ninfer-cli");
++    failures += check(help.find("--video-fps") != std::string::npos, "CLI help omits --video-fps");
++    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).video_fps == 2.0,
++                      "CLI video_fps must default to 2");
++    for (const auto fps : {1U, 2U, 6U, 8U}) {
++        failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--video-fps",
++                                 std::to_string(fps)})
++                              .video_fps == static_cast<double>(fps),
++                          "CLI did not preserve --video-fps");
++    }
++    for (const auto* fps : {"0", "9", "2.5", "-1", "nan"}) {
++        failures += check(rejects([&] {
++                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
++                                           "--video-fps", fps});
++                          }),
++                          "CLI accepted invalid --video-fps");
++    }
+     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).rope_yarn_factor ==
+                           1.0F,
+                       "CLI YaRN factor must default to 1");
+diff --git a/tests/test_serve_options.cpp b/tests/test_serve_options.cpp
+index 5471b58..6ae322a 100644
+--- a/tests/test_serve_options.cpp
++++ b/tests/test_serve_options.cpp
+@@ -207,6 +207,18 @@ int main() {
+     failures +=
+         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
+     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
++    failures += check(defaults.video_fps == 2.0, "serve video_fps must default to 2");
++    failures += check(serve_usage_text("ninfer-serve").find("--video-fps") != std::string::npos,
++                      "serve help omits --video-fps");
++    failures += check(parse({"ninfer-serve", "model.ninfer", "--video-fps", "6"}).video_fps == 6.0,
++                      "serve did not preserve --video-fps");
++    {
++        bool rejected = false;
++        try {
++            (void)parse({"ninfer-serve", "model.ninfer", "--video-fps", "9"});
++        } catch (const std::invalid_argument&) { rejected = true; }
++        failures += check(rejected, "serve accepted --video-fps outside 1..8");
++    }
+     failures += check(defaults.request_log_jsonl.empty(),
+                       "request JSONL logging is not disabled by default");
+     failures += check(defaults.context_cost_presets.empty(),
+-- 
+2.56.0
+

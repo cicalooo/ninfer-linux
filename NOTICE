@@ -1,7 +1,7 @@
 This repository redistributes a prebuilt Linux binary of NInfer-all.
 
 Upstream: https://github.com/iamwavecut/ninfer-all
-Commit:   8319e8f
+Commit:   e7b7e66 + patches/0001-video-fps.patch (f009850)
 License:  Apache License 2.0 (see LICENSE)
 
 NInfer-all consolidates Neroued/ninfer, Don-Chad/ninfer-3090, and other

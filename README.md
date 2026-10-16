@@ -2,7 +2,7 @@
 
 Prebuilt **Linux x64** [NInfer-all](https://github.com/iamwavecut/ninfer-all) CLI for people who do not want to compile CUDA kernels.
 
-This is a redistribution of upstream `ninfer-all` at commit [`e7b7e66`](https://github.com/iamwavecut/ninfer-all/commit/e7b7e669c47703d2c0489e4a01c5ef4dd0f87f81) (master, 2026-10-13; `ninfer --version` prints `0.12.0-rtx3090+e7b7e66`). It is **not** ComfyUI-specific. Use it from a shell, as a server, or from any frontend that can spawn `ninfer`.
+This is a redistribution of upstream `ninfer-all` at commit [`e7b7e66`](https://github.com/iamwavecut/ninfer-all/commit/e7b7e669c47703d2c0489e4a01c5ef4dd0f87f81) plus [`patches/0001-video-fps.patch`](patches/0001-video-fps.patch) (`ninfer --version` prints `0.12.0-rtx3090+f009850`). It is **not** ComfyUI-specific. Use it from a shell, as a server, or from any frontend that can spawn `ninfer`.
 
 ## Hardware
 
@@ -67,7 +67,7 @@ Serve:
 
 Invoke the CLI as `ninfer`, not `ninfer-multicall`. The multicall binary dispatches on `argv[0]`.
 
-Optional flags that this build advertises: `--spec mtp|dflash|dflash2`, `--kv-dtype int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8`, `--vision`, `--vision-residency overlay`.
+Optional flags that this build advertises: `--spec mtp|dflash|dflash2`, `--kv-dtype int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8`, `--vision`, `--vision-residency overlay`, `--video-fps 1..8` (default 2).
 
 ## Rebuild (this tree)
 
@@ -78,6 +78,7 @@ on an i9-10850K.
 ```bash
 git clone https://github.com/iamwavecut/ninfer-all.git && cd ninfer-all
 git checkout e7b7e669c47703d2c0489e4a01c5ef4dd0f87f81
+git apply /path/to/ninfer-linux/patches/0001-video-fps.patch
 export CC=/usr/bin/gcc-15 CXX=/usr/bin/g++-15 CUDACXX=/opt/cuda/bin/nvcc CUDAHOSTCXX=/usr/bin/g++-15
 cmake -S . -B build-sm86 -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX -DCMAKE_CUDA_COMPILER=$CUDACXX \
