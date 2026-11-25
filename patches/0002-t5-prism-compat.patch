@@ -1,4 +1,4 @@
-From f18c5862780736810d2f503d6b545842510ab81c Mon Sep 17 00:00:00 2001
+From 9278660ae88fa67dd1cc6b3bfedba44d36b47d8e Mon Sep 17 00:00:00 2001
 From: cicalooo <153059103+cicalooo@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 11:16:41 +1100
 Subject: [PATCH] feat: lossless load-time t5_g128_fp16 and prism_hadamard
@@ -18,8 +18,9 @@ Subject: [PATCH] feat: lossless load-time t5_g128_fp16 and prism_hadamard
  src/models/qwen3_5/load.cpp                |   1 +
  src/models/qwen3_5/load/bindings.h         |   1 +
  src/models/qwen3_5/load/storage_trades.cpp |  58 +++++++++
+ src/ops/weight_input.cpp                   |   6 +
  tests/artifact/test_materialization.cpp    | 114 +++++++++++++++++
- 14 files changed, 410 insertions(+), 5 deletions(-)
+ 15 files changed, 416 insertions(+), 5 deletions(-)
 
 diff --git a/src/artifact/binder.cpp b/src/artifact/binder.cpp
 index 931853cf..58b1c80e 100644
@@ -516,6 +517,23 @@ index 9986ce2d..81c878fb 100644
  // Device-memory trades selected at startup. Each stores a Q8 matrix at a narrower group-64 width
  // while the weights load; the artifact is unchanged and the measured quality cost of each is in
  // docs/maintainer/quality-trade-experiments.md.
+diff --git a/src/ops/weight_input.cpp b/src/ops/weight_input.cpp
+index 1d125290..58e49dac 100644
+--- a/src/ops/weight_input.cpp
++++ b/src/ops/weight_input.cpp
+@@ -223,6 +223,12 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool
+     if (contiguous(joined)) {
+         auto result       = single(inputs);
+         const auto format = result.weight.qtype;
++        if (dense && format == QType::T2_G128_FP16) {
++            const auto first  = single(inputs.first<2>());
++            const auto second = single(inputs.last<2>());
++            return PairedProjectionWeights{first.weight, second.weight, LinearPolicy::A16Only,
++                                           common_signs(inputs)};
++        }
+         const bool supported =
+             (moe && format == QType::Q8_G32_FP16) ||
+             (dense && (format == QType::NVFP4 || format == QType::FP8_E4M3FN_ROW_BF16 ||
 diff --git a/tests/artifact/test_materialization.cpp b/tests/artifact/test_materialization.cpp
 index aeac549b..8432221c 100644
 --- a/tests/artifact/test_materialization.cpp
