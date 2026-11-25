@@ -2,7 +2,7 @@
 
 Prebuilt **Linux x64** [NInfer-all](https://github.com/iamwavecut/ninfer-all) CLI (`sm_86` focus) for people who do not want to compile CUDA kernels.
 
-This build is based on upstream `ninfer-all` [`2caa901`](https://github.com/iamwavecut/ninfer-all/commit/2caa90160c736b4a5d3d39b8f05a92b31abe20ca) (`master`, 2026-11-24) merged with upstream [PR #468](https://github.com/iamwavecut/ninfer-all/pull/468) (`f84786d`, Ternary Bonsai 2.5 27B `gguf_ptq1_0` + `t2_g128_fp16` + PrismML MTP & Vision) plus [`patches/0002-t5-prism-compat.patch`](patches/0002-t5-prism-compat.patch) (`ninfer --version` prints `ninfer 2026-11-24.7+2026-11-24.7-6-g9278660a (nvcc 13.5.37, 86)`).
+This build is based on upstream `ninfer-all` [`2caa901`](https://github.com/iamwavecut/ninfer-all/commit/2caa90160c736b4a5d3d39b8f05a92b31abe20ca) (`master`, 2026-11-24) merged with upstream [PR #468](https://github.com/iamwavecut/ninfer-all/pull/468) (`f84786d`, Ternary Bonsai 2.5 27B `gguf_ptq1_0` + `t2_g128_fp16` + PrismML MTP & Vision) plus [`patches/0002-t5-prism-compat.patch`](patches/0002-t5-prism-compat.patch) (`ninfer --version` prints `ninfer 2026-11-24.7+2026-11-24.7-6-g79d608ae (nvcc 13.5.37, 86)`).
 
 The old `--video-fps` test patch (`patches/0001-video-fps.patch`) is **not** applied in this release; video sampling uses upstream's 2 fps default.
 

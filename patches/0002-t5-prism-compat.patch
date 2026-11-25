@@ -1,4 +1,4 @@
-From 9278660ae88fa67dd1cc6b3bfedba44d36b47d8e Mon Sep 17 00:00:00 2001
+From 79d608ae3728097dd0e4f06aaba0cd7955dc144d Mon Sep 17 00:00:00 2001
 From: cicalooo <153059103+cicalooo@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 11:16:41 +1100
 Subject: [PATCH] feat: lossless load-time t5_g128_fp16 and prism_hadamard
@@ -18,9 +18,10 @@ Subject: [PATCH] feat: lossless load-time t5_g128_fp16 and prism_hadamard
  src/models/qwen3_5/load.cpp                |   1 +
  src/models/qwen3_5/load/bindings.h         |   1 +
  src/models/qwen3_5/load/storage_trades.cpp |  58 +++++++++
+ src/models/qwen3_5/measurement.cpp         |   8 +-
  src/ops/weight_input.cpp                   |   6 +
  tests/artifact/test_materialization.cpp    | 114 +++++++++++++++++
- 15 files changed, 416 insertions(+), 5 deletions(-)
+ 16 files changed, 422 insertions(+), 7 deletions(-)
 
 diff --git a/src/artifact/binder.cpp b/src/artifact/binder.cpp
 index 931853cf..58b1c80e 100644
@@ -517,6 +518,26 @@ index 9986ce2d..81c878fb 100644
  // Device-memory trades selected at startup. Each stores a Q8 matrix at a narrower group-64 width
  // while the weights load; the artifact is unchanged and the measured quality cost of each is in
  // docs/maintainer/quality-trade-experiments.md.
+diff --git a/src/models/qwen3_5/measurement.cpp b/src/models/qwen3_5/measurement.cpp
+index efcade9e..dc6b9974 100644
+--- a/src/models/qwen3_5/measurement.cpp
++++ b/src/models/qwen3_5/measurement.cpp
+@@ -76,9 +76,13 @@ std::string prefill_signature(const Model& model) {
+             const auto [it, inserted] = parents.emplace(part.parent, parents.size());
+             // A load-time transcode is a storage trade, not a different measured representation:
+             // describe the parent as the artifact stores it.
+-            const auto& geometry =
++            const auto stored_layout =
++                part.parent->stored_format && *part.parent->stored_format == QType::T5_G128_FP16
++                    ? QuantLayout::TernaryRowK128
++                    : part.parent->geometry.layout;
++            const auto geometry =
+                 part.parent->stored_format && *part.parent->stored_format != part.parent->geometry.format
+-                    ? weight_geometry(*part.parent->stored_format, part.parent->geometry.layout,
++                    ? weight_geometry(*part.parent->stored_format, stored_layout,
+                                       part.parent->geometry.shape)
+                     : part.parent->geometry;
+             item["parts"].push_back({it->second, part.begin, part.end, geometry.format,
 diff --git a/src/ops/weight_input.cpp b/src/ops/weight_input.cpp
 index 1d125290..58e49dac 100644
 --- a/src/ops/weight_input.cpp
