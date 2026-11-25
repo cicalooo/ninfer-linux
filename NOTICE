@@ -1,8 +1,13 @@
 This repository redistributes a prebuilt Linux binary of NInfer-all.
 
 Upstream: https://github.com/iamwavecut/ninfer-all
-Commit:   63428ac (upstream master, no local patches)
+Commit:   2caa9016 (upstream master) + PR #468 (dev/bonsai-2-5 @ f84786d9)
+Patches:  patches/0002-t5-prism-compat.patch (lossless t5_g128_fp16 -> t2_g128_fp16 + prism_hadamard)
 License:  Apache License 2.0 (see LICENSE)
+
+Static media libraries linked into ninfer-multicall:
+- FFmpeg 9.0.2 (GNU LGPL 2.1 or later, see LICENSE-ffmpeg.txt)
+- dav1d 1.5.4 (BSD 2-Clause, see LICENSE-dav1d.txt)
 
 NInfer-all consolidates Neroued/ninfer, Don-Chad/ninfer-3090, and other
 forks. Credit for the engine belongs to those authors and the contributors
@@ -10,5 +15,5 @@ listed at:
 
   https://github.com/iamwavecut/ninfer-all/blob/master/CONTRIBUTORS.md
 
-This redistribution adds packaging, an install script, and GitHub Releases.
-It does not claim authorship of the engine.
+This redistribution adds packaging, compatibility patches, an install script,
+and GitHub Releases. It does not claim authorship of the engine.

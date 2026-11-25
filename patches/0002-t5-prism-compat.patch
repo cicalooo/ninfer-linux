@@ -1,0 +1,660 @@
+From f18c5862780736810d2f503d6b545842510ab81c Mon Sep 17 00:00:00 2001
+From: cicalooo <153059103+cicalooo@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:16:41 +1100
+Subject: [PATCH] feat: lossless load-time t5_g128_fp16 and prism_hadamard
+ compatibility
+
+---
+ src/artifact/binder.cpp                    |   3 +-
+ src/artifact/formats.cpp                   |   2 +
+ src/artifact/materializer.cpp              |   6 +-
+ src/artifact/transcode.cpp                 | 141 +++++++++++++++++++++
+ src/artifact/transcode.h                   |   9 ++
+ src/core/qtype.h                           |   4 +
+ src/core/weight.h                          |   2 +
+ src/core/weight_view.cpp                   |   9 ++
+ src/models/qwen3_5/config.cpp              |  54 +++++++-
+ src/models/qwen3_5/config.h                |  11 ++
+ src/models/qwen3_5/load.cpp                |   1 +
+ src/models/qwen3_5/load/bindings.h         |   1 +
+ src/models/qwen3_5/load/storage_trades.cpp |  58 +++++++++
+ tests/artifact/test_materialization.cpp    | 114 +++++++++++++++++
+ 14 files changed, 410 insertions(+), 5 deletions(-)
+
+diff --git a/src/artifact/binder.cpp b/src/artifact/binder.cpp
+index 931853cf..58b1c80e 100644
+--- a/src/artifact/binder.cpp
++++ b/src/artifact/binder.cpp
+@@ -166,8 +166,7 @@ void Binder::transcode_device(ObjectHandle object, QType target) {
+     if (demand.host) {
+         throw ArtifactError(tensor.id + ": a transcoded object cannot also keep Host bytes");
+     }
+-    if (geometry.layout != QuantLayout::RowSplit ||
+-        !row_split_transcode_supported(geometry.format, target)) {
++    if (!device_transcode_supported(geometry.format, geometry.layout, target)) {
+         throw ArtifactError(tensor.id + ": object format cannot be transcoded as requested");
+     }
+     if (demand.transcode && *demand.transcode != target) {
+diff --git a/src/artifact/formats.cpp b/src/artifact/formats.cpp
+index 2aecad5e..b9dfd6de 100644
+--- a/src/artifact/formats.cpp
++++ b/src/artifact/formats.cpp
+@@ -42,6 +42,7 @@ constexpr std::array kFormats = {
+     std::pair{QType::GGUF_MXFP4, std::string_view{"gguf_mxfp4"}},
+     std::pair{QType::GGUF_NVFP4, std::string_view{"gguf_nvfp4"}},
+     std::pair{QType::GGUF_PTQ1_0, std::string_view{"gguf_ptq1_0"}},
++    std::pair{QType::T5_G128_FP16, std::string_view{"t5_g128_fp16"}},
+     std::pair{QType::FP16, std::string_view{"fp16"}},
+     std::pair{QType::UINT16, std::string_view{"uint16"}},
+ };
+@@ -52,6 +53,7 @@ constexpr std::array kLayouts = {
+     std::pair{QuantLayout::RowInterleaved, std::string_view{"row_interleaved_v1"}},
+     std::pair{QuantLayout::BlockScaleK16M128x4, std::string_view{"block_scale_k16_m128x4_v1"}},
+     std::pair{QuantLayout::GgufBlocks, std::string_view{"gguf_blocks_v1"}},
++    std::pair{QuantLayout::TernaryRowK128, std::string_view{"ternary_row_k128_v1"}},
+ };
+ 
+ // Layouts a device may hold but an artifact may never declare. They are produced by a load-time
+diff --git a/src/artifact/materializer.cpp b/src/artifact/materializer.cpp
+index 5953ad97..02bca496 100644
+--- a/src/artifact/materializer.cpp
++++ b/src/artifact/materializer.cpp
+@@ -502,8 +502,10 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
+         const auto source = reader.read_object(placement->object);
+         totals.read_bytes = checked_add(totals.read_bytes, source.size(), "transcode read bytes");
+         std::vector<std::byte> encoded(static_cast<std::size_t>(placement->bytes));
+-        transcode_row_split(*placement->transcode,
+-                            reader.directory().tensor(placement->object).shape, source, encoded);
++        const auto& source_geometry = reader.geometry(placement->object);
++        transcode_device_payload(source_geometry.format, source_geometry.layout,
++                                 *placement->transcode,
++                                 reader.directory().tensor(placement->object).shape, source, encoded);
+         const ScopedRank bound(device, placement->rank);
+         check_cuda(ninfer::copy_and_wait(bases[placement->rank] + placement->offset, encoded.data(),
+                                          encoded.size(), cudaMemcpyHostToDevice),
+diff --git a/src/artifact/transcode.cpp b/src/artifact/transcode.cpp
+index 2f840167..47c2b380 100644
+--- a/src/artifact/transcode.cpp
++++ b/src/artifact/transcode.cpp
+@@ -210,6 +210,147 @@ bool row_split_transcode_supported(QType source, QType target) noexcept {
+            (target == QType::Q4_G64_FP16 || target == QType::Q6_G64_FP16);
+ }
+ 
++bool device_transcode_supported(QType source, QuantLayout source_layout, QType target) noexcept {
++    if (source_layout == QuantLayout::RowSplit && row_split_transcode_supported(source, target)) {
++        return true;
++    }
++    return source == QType::T5_G128_FP16 && source_layout == QuantLayout::TernaryRowK128 &&
++           target == QType::T2_G128_FP16;
++}
++
++namespace {
++
++void transcode_t5_rows(const WeightGeometry& source_geometry, const WeightGeometry& target_geometry,
++                       std::span<const std::byte> source, std::span<std::byte> destination,
++                       std::uint64_t row_begin, std::uint64_t row_end) {
++    // 0 -> -1 (0b11 = 3), 1 -> 0 (0b00 = 0), 2 -> +1 (0b01 = 1)
++    static constexpr std::array<std::uint8_t, 3> kTritToT2{3U, 0U, 1U};
++    const std::uint64_t units = source_geometry.shape[1] / 64;
++    const std::byte* const src_codes = source.data();
++    std::byte* const dst_codes       = destination.data();
++
++    for (std::uint64_t row = row_begin; row < row_end; ++row) {
++        const std::byte* src_unit = src_codes + row * source_geometry.code_bytes_per_row;
++        std::byte* dst_unit       = dst_codes + row * target_geometry.code_bytes_per_row;
++        for (std::uint64_t unit = 0; unit < units; ++unit, src_unit += 13, dst_unit += 16) {
++            std::array<std::uint8_t, 64> trits{};
++            for (int i = 0; i < 12; ++i) {
++                const int orig = std::to_integer<int>(src_unit[i]);
++                int rem        = orig;
++                const int g    = i / 4;
++                const int j    = i % 4;
++                int val        = 0;
++                for (int m = 0; m < 5; ++m) {
++                    rem *= 3;
++                    const int t = rem >> 8;
++                    rem &= 255;
++                    if (t < 0 || t > 2) {
++                        throw ArtifactError("t5_g128_fp16 trit out of range");
++                    }
++                    trits[20 * g + 4 * m + j] = static_cast<std::uint8_t>(t);
++                    val                       = val * 3 + t;
++                }
++                if (((256 * val + 242) / 243) != orig) {
++                    throw ArtifactError("t5_g128_fp16 contains non-canonical base-3 byte");
++                }
++            }
++            {
++                const int orig = std::to_integer<int>(src_unit[12]);
++                int rem        = orig;
++                int val        = 0;
++                for (int m = 0; m < 5; ++m) {
++                    rem *= 3;
++                    const int t = rem >> 8;
++                    rem &= 255;
++                    if (t < 0 || t > 2) {
++                        throw ArtifactError("t5_g128_fp16 trit out of range");
++                    }
++                    if (m < 4) {
++                        trits[60 + m] = static_cast<std::uint8_t>(t);
++                    } else if (t != 0) {
++                        throw ArtifactError("t5_g128_fp16 byte 12 must have zero fifth trit");
++                    }
++                    val = val * 3 + t;
++                }
++                if (((256 * val + 242) / 243) != orig) {
++                    throw ArtifactError("t5_g128_fp16 contains non-canonical base-3 byte");
++                }
++            }
++            for (int b = 0; b < 16; ++b) {
++                const std::uint8_t packed = static_cast<std::uint8_t>(
++                    kTritToT2[trits[4 * b]] | (kTritToT2[trits[4 * b + 1]] << 2U) |
++                    (kTritToT2[trits[4 * b + 2]] << 4U) | (kTritToT2[trits[4 * b + 3]] << 6U));
++                dst_unit[b] = static_cast<std::byte>(packed);
++            }
++        }
++    }
++}
++
++void transcode_t5_to_t2(std::span<const std::uint64_t> shape, std::span<const std::byte> source,
++                        std::span<std::byte> destination) {
++    const WeightGeometry source_geometry =
++        weight_geometry(QType::T5_G128_FP16, QuantLayout::TernaryRowK128, shape);
++    const WeightGeometry target_geometry =
++        weight_geometry(QType::T2_G128_FP16, QuantLayout::RowSplit, shape);
++    if (source.size() != source_geometry.bytes || destination.size() != target_geometry.bytes ||
++        source_geometry.scale_bytes != target_geometry.scale_bytes) {
++        throw ArtifactError("t5_g128_fp16 transcode payload sizes do not match the tensor shape");
++    }
++    std::fill(destination.begin(), destination.end(), std::byte{0});
++
++    const std::uint64_t rows = shape[0];
++    const std::uint64_t workers = std::clamp<std::uint64_t>(
++        std::thread::hardware_concurrency(), 1, std::max<std::uint64_t>(rows, 1));
++    if (workers == 1) {
++        transcode_t5_rows(source_geometry, target_geometry, source, destination, 0, rows);
++    } else {
++        std::vector<std::thread> pool;
++        pool.reserve(static_cast<std::size_t>(workers - 1));
++        std::vector<std::exception_ptr> failures(static_cast<std::size_t>(workers));
++        for (std::uint64_t worker = 1; worker < workers; ++worker) {
++            pool.emplace_back([&, worker] {
++                try {
++                    transcode_t5_rows(source_geometry, target_geometry, source, destination,
++                                      rows * worker / workers, rows * (worker + 1) / workers);
++                } catch (...) {
++                    failures[static_cast<std::size_t>(worker)] = std::current_exception();
++                }
++            });
++        }
++        try {
++            transcode_t5_rows(source_geometry, target_geometry, source, destination, 0,
++                              rows / workers);
++        } catch (...) {
++            failures[0] = std::current_exception();
++        }
++        for (std::thread& thread : pool) { thread.join(); }
++        for (const std::exception_ptr& failure : failures) {
++            if (failure) { std::rethrow_exception(failure); }
++        }
++    }
++    std::memcpy(destination.data() + target_geometry.scale_offset,
++                source.data() + source_geometry.scale_offset, target_geometry.scale_bytes);
++}
++
++} // namespace
++
++void transcode_device_payload(QType source_format, QuantLayout source_layout, QType target,
++                              std::span<const std::uint64_t> shape,
++                              std::span<const std::byte> source,
++                              std::span<std::byte> destination) {
++    if (source_format == QType::T5_G128_FP16 && source_layout == QuantLayout::TernaryRowK128 &&
++        target == QType::T2_G128_FP16) {
++        transcode_t5_to_t2(shape, source, destination);
++        return;
++    }
++    if (source_layout == QuantLayout::RowSplit &&
++        row_split_transcode_supported(source_format, target)) {
++        transcode_row_split(target, shape, source, destination);
++        return;
++    }
++    throw ArtifactError("unsupported device payload transcode");
++}
++
+ void transcode_row_split(QType target, std::span<const std::uint64_t> shape,
+                          std::span<const std::byte> source, std::span<std::byte> destination) {
+     const TargetCodec codec = target_codec(target);
+diff --git a/src/artifact/transcode.h b/src/artifact/transcode.h
+index 9c26f665..16113b40 100644
+--- a/src/artifact/transcode.h
++++ b/src/artifact/transcode.h
+@@ -17,6 +17,8 @@ namespace ninfer::artifact {
+ // Q6_G64_FP16 in the same layout. Logical element addressing (row * columns + column) is the same
+ // before and after, so bindings over parts of a transcoded object stay valid.
+ [[nodiscard]] bool row_split_transcode_supported(QType source, QType target) noexcept;
++[[nodiscard]] bool device_transcode_supported(QType source, QuantLayout source_layout,
++                                              QType target) noexcept;
+ 
+ // Requantizes a row-split Q8_G32_FP16 payload to the target format's row-split encoding. Each
+ // 64-column group takes, of 25 clipping ratios of absmax/qmax in [0.70, 1.18], the fp16 scale whose
+@@ -26,4 +28,11 @@ namespace ninfer::artifact {
+ void transcode_row_split(QType target, std::span<const std::uint64_t> shape,
+                          std::span<const std::byte> source, std::span<std::byte> destination);
+ 
++// Transcodes a supported device payload (`Q8_G32_FP16` RowSplit -> Q4/Q6 RowSplit, or lossless
++// `T5_G128_FP16` TernaryRowK128 -> `T2_G128_FP16` RowSplit).
++void transcode_device_payload(QType source_format, QuantLayout source_layout, QType target,
++                              std::span<const std::uint64_t> shape,
++                              std::span<const std::byte> source,
++                              std::span<std::byte> destination);
++
+ } // namespace ninfer::artifact
+diff --git a/src/core/qtype.h b/src/core/qtype.h
+index bca8af60..60c73f76 100644
+--- a/src/core/qtype.h
++++ b/src/core/qtype.h
+@@ -63,6 +63,10 @@ enum class QType : std::uint16_t {
+     // values 16 t + i, byte i >= 16 values 80 + 8 t + i - 16 (digit t = 0..4), qh byte h values
+     // 120 + 2 t + h (t = 0..3); digit t of byte q is ((q * 3^t) mod 256) * 3 >> 8, value digit - 1.
+     GGUF_PTQ1_0 = 34,
++    // Scaled base-3 ternary codes {-1, 0, +1} (stored as {0, 1, 2}) in 13-byte units of 64
++    // columns, with one binary16 multiplier per 128 columns (TernaryRowK128 layout). Transcoded
++    // losslessly to T2_G128_FP16 at load time.
++    T5_G128_FP16 = 35,
+ };
+ 
+ [[nodiscard]] constexpr bool is_gguf(QType format) {
+diff --git a/src/core/weight.h b/src/core/weight.h
+index 2a5a2393..0ad7a3f9 100644
+--- a/src/core/weight.h
++++ b/src/core/weight.h
+@@ -23,6 +23,8 @@ enum class QuantLayout : std::uint16_t {
+     // Rows of whole ggml blocks, as a GGUF stores them.
+     GgufBlocks = 5,
+     RowInterleaved = 6,
++    // 13-byte scaled base-3 units of 64 ternary columns, followed by FP16 scales per 128 columns.
++    TernaryRowK128 = 7,
+ };
+ 
+ // Rows per stored panel. Four 32-byte records is exactly one 128-byte line, which is all the
+diff --git a/src/core/weight_view.cpp b/src/core/weight_view.cpp
+index 0669f53c..ccbc0eb9 100644
+--- a/src/core/weight_view.cpp
++++ b/src/core/weight_view.cpp
+@@ -182,6 +182,15 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
+         out.scale_bytes_per_row = k / 16;
+         out.code_bytes          = out.elements / 2;
+         out.scale_offset        = aligned(out.code_bytes, 256);
++    } else if (layout == QuantLayout::TernaryRowK128) {
++        if (format != QType::T5_G128_FP16 || k % 128) {
++            throw std::invalid_argument("TernaryRowK128 requires T5_G128_FP16 and K%128=0");
++        }
++        out.group_size          = 128;
++        out.code_bytes_per_row  = mul(k / 64, 13);
++        out.scale_bytes_per_row = mul(k / 128, 2);
++        out.code_bytes          = mul(n, out.code_bytes_per_row);
++        out.scale_offset        = aligned(out.code_bytes, 256);
+     } else {
+         throw std::invalid_argument("unknown quantized weight layout");
+     }
+diff --git a/src/models/qwen3_5/config.cpp b/src/models/qwen3_5/config.cpp
+index d657dd73..9899d07c 100644
+--- a/src/models/qwen3_5/config.cpp
++++ b/src/models/qwen3_5/config.cpp
+@@ -107,6 +107,54 @@ RopeConfig rope(const Json& value, std::uint32_t head_dim) {
+     return out;
+ }
+ 
++PrismHadamardConfig prism_hadamard(const Json& value) {
++    require_members(value,
++                    {"version", "transform", "block_size", "sign_mode", "sign_widths", "signs",
++                     "rotated_inputs", "embedding_inverse"},
++                    {}, "prism_hadamard");
++    if (value.at("version") != 1 || value.at("transform") != "normalized-sylvester-walsh-hadamard" ||
++        value.at("sign_mode") != "explicit" ||
++        value.at("block_size") != PrismHadamardConfig::kBlockSize) {
++        throw ArtifactError("prism_hadamard: unsupported version, transform, sign mode or block");
++    }
++    if (!value.at("embedding_inverse").is_boolean()) {
++        throw ArtifactError("prism_hadamard: embedding_inverse must be boolean");
++    }
++    PrismHadamardConfig out;
++    out.embedding_inverse = value.at("embedding_inverse").get<bool>();
++    const auto& widths    = value.at("sign_widths");
++    const auto& signs     = value.at("signs");
++    if (!widths.is_array() || widths.empty() || !signs.is_object() ||
++        signs.size() != widths.size()) {
++        throw ArtifactError("prism_hadamard: every sign width needs one sign parameter");
++    }
++    for (const auto& item : widths) {
++        const auto width = artifact::require_u64(item, "prism_hadamard sign width", true);
++        const auto key   = std::to_string(width);
++        if (width % PrismHadamardConfig::kBlockSize || !signs.contains(key) ||
++            !signs.at(key).is_string() ||
++            !out.signs.emplace(width, signs.at(key).get<std::string>()).second) {
++            throw ArtifactError("prism_hadamard: invalid or duplicate sign width " + key);
++        }
++    }
++    static const std::set<std::string_view> kProjections = {
++        "attention/query", "attention/key",  "attention/gate", "attention/value",
++        "attention/output", "gdn/query",     "gdn/key",        "gdn/value",
++        "gdn/z",            "gdn/output",    "mlp/gate",       "mlp/up",
++        "mlp/down",         "output_head"};
++    const auto& rotated = value.at("rotated_inputs");
++    if (!rotated.is_array() || rotated.empty()) {
++        throw ArtifactError("prism_hadamard: rotated_inputs must list projections");
++    }
++    for (const auto& item : rotated) {
++        if (!item.is_string() || !kProjections.contains(item.get<std::string>()) ||
++            !out.rotated_inputs.insert(item.get<std::string>()).second) {
++            throw ArtifactError("prism_hadamard: unknown or repeated rotated input");
++        }
++    }
++    return out;
++}
++
+ TextConfig text(const Json& value, bool mtp) {
+     require_members(
+         value,
+@@ -115,7 +163,8 @@ TextConfig text(const Json& value, bool mtp) {
+         {"num_attention_heads", "num_key_value_heads", "head_dim", "rope_parameters",
+          "linear_num_key_heads", "linear_key_head_dim", "linear_num_value_heads",
+          "linear_value_head_dim", "linear_conv_kernel_dim", "intermediate_size", "num_experts",
+-         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size"},
++         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size",
++         "prism_hadamard"},
+         "text config");
+     TextConfig out;
+     out.architecture = resolve_architecture(
+@@ -181,6 +230,9 @@ TextConfig text(const Json& value, bool mtp) {
+         }
+         out.ffn = DenseConfig{dimension(value, "intermediate_size")};
+     }
++    if (value.contains("prism_hadamard")) {
++        out.prism_hadamard = prism_hadamard(value.at("prism_hadamard"));
++    }
+     return out;
+ }
+ 
+diff --git a/src/models/qwen3_5/config.h b/src/models/qwen3_5/config.h
+index 52bb2bd2..477dc8ad 100644
+--- a/src/models/qwen3_5/config.h
++++ b/src/models/qwen3_5/config.h
+@@ -8,7 +8,10 @@
+ #include <array>
+ #include <algorithm>
+ #include <cstdint>
++#include <map>
+ #include <optional>
++#include <set>
++#include <string>
+ #include <variant>
+ #include <vector>
+ 
+@@ -72,6 +75,13 @@ struct MoeConfig {
+     std::uint32_t shared_expert_intermediate_size = 0;
+ };
+ 
++struct PrismHadamardConfig {
++    static constexpr std::uint32_t kBlockSize = 1024;
++    bool embedding_inverse                    = false;
++    std::map<std::uint64_t, std::string> signs;
++    std::set<std::string> rotated_inputs;
++};
++
+ struct TextConfig {
+     Architecture architecture             = Architecture::Qwen3_5;
+     std::uint32_t hidden_size             = 0;
+@@ -88,6 +98,7 @@ struct TextConfig {
+     std::optional<RopeConfig> rope_parameters;
+     std::optional<GdnConfig> gdn;
+     std::variant<DenseConfig, MoeConfig> ffn;
++    std::optional<PrismHadamardConfig> prism_hadamard;
+ };
+ 
+ struct VisionConfig {
+diff --git a/src/models/qwen3_5/load.cpp b/src/models/qwen3_5/load.cpp
+index f59965b1..dbc2cbc7 100644
+--- a/src/models/qwen3_5/load.cpp
++++ b/src/models/qwen3_5/load.cpp
+@@ -139,6 +139,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
+         if (out->weights.mtp) { out->weights.mtp->output_head = out->weights.proposal->head; }
+         if (out->weights.draft) { out->weights.draft->output_head = out->weights.proposal->head; }
+     }
++    loading::apply_prism_t5_compat(bindings, out->config);
+     loading::apply_storage_trades(bindings, out->config, out->weights, options);
+     if (rank_tiers.empty()) { rank_tiers.assign(options.ranks, ops::current_device_tier()); }
+     loading::apply_rank_policies(bindings, rank_tiers);
+diff --git a/src/models/qwen3_5/load/bindings.h b/src/models/qwen3_5/load/bindings.h
+index 79a0f52f..c4c41f1c 100644
+--- a/src/models/qwen3_5/load/bindings.h
++++ b/src/models/qwen3_5/load/bindings.h
+@@ -184,6 +184,7 @@ void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig&
+                                             std::uint32_t public_tokens);
+ // --lm-head-q4/q6, --embedding-q4/q6 and --mtp-experts-q4: validate the combination and request
+ // the load-time transcodes on the selected parameters.
++void apply_prism_t5_compat(Bindings& bindings, const Config& config);
+ void apply_storage_trades(Bindings& bindings, const Config& config, const ModelWeights& weights,
+                           const LoadOptions& options);
+ // The FP8 A8 and NVFP4 A4 permissions a stored weight keeps only on a rank whose device runs the
+diff --git a/src/models/qwen3_5/load/storage_trades.cpp b/src/models/qwen3_5/load/storage_trades.cpp
+index 9986ce2d..81c878fb 100644
+--- a/src/models/qwen3_5/load/storage_trades.cpp
++++ b/src/models/qwen3_5/load/storage_trades.cpp
+@@ -1,16 +1,74 @@
+ #include "models/qwen3_5/load/bindings.h"
+ 
+ #include "artifact/permute_row_split.h"
++#include "artifact/schema.h"
+ #include "core/qtype.h"
+ 
+ #include <span>
+ #include <stdexcept>
+ #include <string>
++#include <string_view>
+ #include <unordered_map>
+ #include <variant>
+ 
+ namespace ninfer::models::qwen3_5::loading {
+ 
++void apply_prism_t5_compat(Bindings& bindings, const Config& config) {
++    const auto* prism = config.text.prism_hadamard ? &*config.text.prism_hadamard : nullptr;
++    std::unordered_map<std::uint64_t, WeightId> sign_ids;
++    if (prism) {
++        for (const auto& [width, name] : prism->signs) {
++            sign_ids.emplace(width, bindings.direct(name, {width}, QType::BF16));
++        }
++        for (PendingWeight& weight : bindings.weights) {
++            const std::string_view name = weight.reference.name;
++            std::string_view role;
++            if (name == "text/output_head") {
++                role = "output_head";
++            } else if (name.starts_with("text/layers/")) {
++                const auto after_prefix = name.substr(std::string_view("text/layers/").size());
++                const auto slash        = after_prefix.find('/');
++                if (slash != std::string_view::npos) { role = after_prefix.substr(slash + 1); }
++            }
++            if (role.empty() || !prism->rotated_inputs.contains(std::string(role))) { continue; }
++            if (weight.reference.shape.size() != 2) {
++                throw artifact::ArtifactError(weight.reference.name +
++                                              ": prism_hadamard projection must be a matrix");
++            }
++            const auto found = sign_ids.find(weight.reference.shape[1]);
++            if (found == sign_ids.end()) {
++                throw artifact::ArtifactError(weight.reference.name +
++                                              ": missing prism_hadamard sign vector for width " +
++                                              std::to_string(weight.reference.shape[1]));
++            }
++            for (WeightUse& use : weight.uses) {
++                if (!use.hadamard_signs) {
++                    use.hadamard_signs = found->second;
++                    use.hadamard_begin = 0;
++                }
++            }
++        }
++    }
++    for (const PendingWeight& weight : bindings.weights) {
++        bool has_t5 = false;
++        for (const auto& part : weight.reference.binding.parts) {
++            if (bindings.binder.geometry(part.object).format != QType::T5_G128_FP16) { continue; }
++            has_t5 = true;
++            if (weight.reference.residency != artifact::Residency::Device) {
++                throw std::invalid_argument(
++                    "--embedding-residency host is not supported with t5_g128_fp16 artifacts; "
++                    "use default device residency");
++            }
++            bindings.binder.transcode_device(part.object, QType::T2_G128_FP16);
++        }
++        if (has_t5 && weight.reference.name == "text/token_embedding" &&
++            (!prism || !prism->embedding_inverse)) {
++            throw artifact::ArtifactError(
++                "t5_g128_fp16 token_embedding requires prism_hadamard.embedding_inverse=true");
++        }
++    }
++}
++
+ // Device-memory trades selected at startup. Each stores a Q8 matrix at a narrower group-64 width
+ // while the weights load; the artifact is unchanged and the measured quality cost of each is in
+ // docs/maintainer/quality-trade-experiments.md.
+diff --git a/tests/artifact/test_materialization.cpp b/tests/artifact/test_materialization.cpp
+index aeac549b..8432221c 100644
+--- a/tests/artifact/test_materialization.cpp
++++ b/tests/artifact/test_materialization.cpp
+@@ -2,6 +2,7 @@
+ #include "artifact/fixture.h"
+ #include "artifact/permute_row_split.h"
+ #include "artifact/selection.h"
++#include "artifact/transcode.h"
+ #include "artifact/views.h"
+ #include "core/device.h"
+ #include "core/device_buffer.h"
+@@ -684,6 +685,118 @@ void pipeline_rank_placement() {
+     }
+ }
+ 
++void transcode_t5(DeviceContext& device) {
++    constexpr std::uint64_t kRows = 4;
++    constexpr std::uint64_t kCols = 256;
++    const auto src_geo = weight_geometry(QType::T5_G128_FP16, QuantLayout::TernaryRowK128,
++                                         std::array<std::uint64_t, 2>{kRows, kCols});
++    const auto dst_geo = weight_geometry(QType::T2_G128_FP16, QuantLayout::RowSplit,
++                                         std::array<std::uint64_t, 2>{kRows, kCols});
++
++    std::vector<std::byte> t5_payload(static_cast<std::size_t>(src_geo.bytes), std::byte{0});
++    std::vector<std::byte> expected_t2(static_cast<std::size_t>(dst_geo.bytes), std::byte{0});
++    static constexpr std::array<std::uint8_t, 3> kTritToT2{3U, 0U, 1U};
++
++    for (std::uint64_t row = 0; row < kRows; ++row) {
++        for (std::uint64_t unit = 0; unit < kCols / 64; ++unit) {
++            std::array<std::uint8_t, 65> trits{};
++            for (std::uint64_t col = 0; col < 64; ++col) {
++                const std::uint64_t global_col = unit * 64 + col;
++                trits[col] = static_cast<std::uint8_t>((row * 5 + global_col * 3 + unit) % 3);
++            }
++            trits[64] = 0;
++            const std::size_t src_off =
++                static_cast<std::size_t>(row * src_geo.code_bytes_per_row + unit * 13);
++            for (int i = 0; i < 12; ++i) {
++                const int g = i / 4;
++                const int j = i % 4;
++                int val     = 0;
++                for (int m = 0; m < 5; ++m) { val = val * 3 + trits[20 * g + 4 * m + j]; }
++                t5_payload[src_off + i] = static_cast<std::byte>((256 * val + 242) / 243);
++            }
++            {
++                int val = 0;
++                for (int m = 0; m < 5; ++m) { val = val * 3 + trits[60 + m]; }
++                t5_payload[src_off + 12] = static_cast<std::byte>((256 * val + 242) / 243);
++            }
++            const std::size_t dst_off =
++                static_cast<std::size_t>(row * dst_geo.code_bytes_per_row + unit * 16);
++            for (int b = 0; b < 16; ++b) {
++                expected_t2[dst_off + b] = static_cast<std::byte>(
++                    kTritToT2[trits[4 * b]] | (kTritToT2[trits[4 * b + 1]] << 2U) |
++                    (kTritToT2[trits[4 * b + 2]] << 4U) | (kTritToT2[trits[4 * b + 3]] << 6U));
++            }
++        }
++        for (std::uint64_t g = 0; g < kCols / 128; ++g) {
++            const std::uint16_t scale = static_cast<std::uint16_t>(0x3800U + row * 0x0100U + g);
++            put_word(t5_payload, static_cast<std::size_t>(src_geo.scale_offset + row * 4 + g * 2),
++                     scale, 2);
++            put_word(expected_t2, static_cast<std::size_t>(dst_geo.scale_offset + row * 4 + g * 2),
++                     scale, 2);
++        }
++    }
++
++    std::vector<std::byte> transcoded(static_cast<std::size_t>(dst_geo.bytes));
++    transcode_device_payload(QType::T5_G128_FP16, QuantLayout::TernaryRowK128, QType::T2_G128_FP16,
++                             std::array<std::uint64_t, 2>{kRows, kCols}, t5_payload, transcoded);
++    require(transcoded == expected_t2, "T5 -> T2 transcode bytes differ from expected layout");
++
++    {
++        auto bad = t5_payload;
++        bad[0]   = std::byte{1}; // non-canonical base-3 byte (val=0->0, val=1->2)
++        rejects(
++            [&] {
++                transcode_device_payload(QType::T5_G128_FP16, QuantLayout::TernaryRowK128,
++                                         QType::T2_G128_FP16,
++                                         std::array<std::uint64_t, 2>{kRows, kCols}, bad,
++                                         transcoded);
++            },
++            "non-canonical base-3 byte was accepted");
++    }
++    {
++        auto bad = t5_payload;
++        bad[12]  = std::byte{255}; // canonical byte for val=242, whose 5th trit is 2 != 0
++        rejects(
++            [&] {
++                transcode_device_payload(QType::T5_G128_FP16, QuantLayout::TernaryRowK128,
++                                         QType::T2_G128_FP16,
++                                         std::array<std::uint64_t, 2>{kRows, kCols}, bad,
++                                         transcoded);
++            },
++            "nonzero padding trit in byte 12 was accepted");
++    }
++
++    // End-to-end artifact materialization of a T5_G128_FP16 object transcoded to T2_G128_FP16.
++    Fixture fixture;
++    fixture.payload = t5_payload;
++    fixture.root    = {
++        {"components", {{"text", {{"config", Json::object()}}}}},
++        {"objects", Json::array({{{"id", "t5"},
++                                  {"kind", "tensor"},
++                                  {"shape", {kRows, kCols}},
++                                  {"format", "t5_g128_fp16"},
++                                  {"layout", "ternary_row_k128_v1"},
++                                  {"offset", 0},
++                                  {"bytes", src_geo.bytes}}})},
++        {"bindings", {{"w", {{"object", "t5"}}}}},
++        {"uses", Json::array()},
++        {"files", Json::array({{{"path", nullptr}, {"payload_bytes", src_geo.bytes}}})}};
++    fixture.write(false);
++
++    Reader reader(fixture.entry);
++    Binder binder(reader);
++    const auto w_ref = binder.parameter("w", {kRows, kCols});
++    binder.transcode_device(reader.find("t5"), QType::T2_G128_FP16);
++    auto backing     = materialize(reader, std::move(binder).finish(), device);
++    const auto view  = bind_view(w_ref, backing);
++    const auto w     = native_weight(view);
++    require(w.qtype == QType::T2_G128_FP16 && w.layout == QuantLayout::RowSplit,
++            "transcoded device parent did not expose T2_G128_FP16 RowSplit");
++    std::vector<std::byte> uploaded(static_cast<std::size_t>(dst_geo.bytes));
++    CUDA_CHECK(cudaMemcpy(uploaded.data(), w.payload, uploaded.size(), cudaMemcpyDeviceToHost));
++    require(uploaded == expected_t2, "materialized T5 -> T2 GPU bytes differ from expected");
++}
++
+ } // namespace
+ 
+ int main(int argc, char** argv) {
+@@ -720,6 +833,7 @@ int main(int argc, char** argv) {
+         std::cout << "artifact materialization CUDA fault injection skipped (no --wrap)\n";
+ #endif
+         staging_reuse(device);
++        transcode_t5(device);
+         std::cout << "artifact materialization checks passed\n";
+         return 0;
+     } catch (const std::exception& error) {
+-- 
+2.56.1
+
