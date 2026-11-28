@@ -1,0 +1,900 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cicalooo <153059103+cicalooo@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 22:48:46 +1100
+Subject: [PATCH] feat: add Qwen3.5 9B GDN gating and CausalD256H16Kv4
+ attention support
+
+- Add Bf16Gdn9Geometry ([32, 4096]) MMA schedules, kernels, and wrapper
+  validation for 9B GDN gating projections.
+- Add CausalD256H16Kv4 (16 query heads / 4 KV heads) causal softmax
+  attention geometry and pass kv_heads where query-head count overlaps
+  with CausalD256H16Kv2.
+- Allow non-BF16 encoded block formats in tools/convert/gguf_blocks.py
+  gdn_control_source (dequantized to BF16).
+---
+ .../bf16/bf16_gdn_gating_proj_gemm_mma.cuh    |  7 ++
+ .../bf16/bf16_gdn_gating_proj_kernels.cu      | 73 +++++++++++++++++++
+ .../bf16/bf16_gdn_gating_proj_kernels.h       | 21 ++++++
+ .../bf16/bf16_gdn_gating_proj_plan.cpp        | 54 ++++++++++++--
+ .../causal_cache/causal_softmax_attention.cpp | 38 +++++-----
+ .../dense/causal_cache/fp8/prompt.cu          |  2 +-
+ .../dense/causal_cache/fp8/small_t.cpp        |  9 ++-
+ .../dense/causal_cache/geometry.cuh           | 15 +++-
+ .../causal_cache/int8/small_t_dispatch.cpp    |  2 +
+ .../dense/causal_cache/k8v4/prompt.cu         |  2 +-
+ .../dense/causal_cache/k8v4/small_t.cpp       |  9 ++-
+ .../dense/causal_cache/nvfp4/prompt.cu        |  2 +-
+ .../dense/causal_cache/nvfp4/prompt_fast.cu   |  2 +-
+ .../dense/causal_cache/nvfp4/small_t.cpp      |  9 ++-
+ .../dense/causal_cache/prompt.cpp             |  4 +-
+ .../dense/causal_cache/route.h                |  3 +-
+ .../dense/causal_cache/small_t.cpp            | 17 +++--
+ src/ops/softmax_attention/sources.cmake       |  6 +-
+ src/ops/weight_input.cpp                      |  6 +-
+ src/ops/wrapper/gdn_gating_proj.cpp           | 53 ++++++++++----
+ tools/convert/gguf_blocks.py                  |  6 +-
+ 21 files changed, 266 insertions(+), 74 deletions(-)
+
+diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh
+index 09746a10..143dbecd 100644
+--- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh
++++ b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh
+@@ -48,8 +48,15 @@ struct Bf16Gdn35Geometry {
+     static constexpr int kBlockN = 64;
+ };
+ 
++struct Bf16Gdn9Geometry {
++    static constexpr int kHeads  = 32;
++    static constexpr int kHidden = 4096;
++    static constexpr int kBlockN = 64;
++};
++
+ static_assert(Bf16Gdn27Geometry::kHidden % kBf16GdnBlockK == 0);
+ static_assert(Bf16Gdn35Geometry::kHidden % kBf16GdnBlockK == 0);
++static_assert(Bf16Gdn9Geometry::kHidden % kBf16GdnBlockK == 0);
+ 
+ __device__ __forceinline__ int bf16_gdn_swizzle(int row, int col) {
+     return (col & ~63) + gemm_swz64(row, col & 63);
+diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
+index 8363eab3..8cc36277 100644
+--- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
++++ b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
+@@ -37,6 +37,9 @@ constexpr int k35N           = 32;
+ constexpr int k35K           = 2048;
+ constexpr int k35LogicalRows = 2 * k35N;
+ 
++constexpr int k9N = 32;
++constexpr int k9K = 4096;
++
+ template <int TokenTile, int KSlice, int RowsPerBlock>
+ __global__ void bf16_gdn_gating_proj_small_t_partial_kernel(
+     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
+@@ -259,6 +262,13 @@ void require_shape35(const Weight& w, const char* name) {
+     }
+ }
+ 
++void require_shape9(const Weight& w, const char* name) {
++    if (w.n != k9N || w.k != k9K || w.shape[0] != k9N || w.shape[1] != k9K) {
++        throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
++                                    " requires contiguous BF16 [32,4096]");
++    }
++}
++
+ // CTAs of one cooperative split-K kernel the current device holds per SM, the lesser of its
+ // full-tile and predicated forms: the occupancy of the compiled kernel (its registers, block size
+ // and shared memory) on that device, so a Turing SM's 64 KiB of shared memory and an sm_86 SM's
+@@ -653,6 +663,69 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
+                                                            nullptr, g, beta, stream);
+ }
+ 
++bool bf16_gdn_gating_proj_9_mma_split16_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
++                                               const Weight& a_weight, const Weight& b_weight,
++                                               const Tensor& A_log, const Tensor& dt_bias,
++                                               void* workspace, Tensor& g, Tensor& beta,
++                                               std::int32_t multiprocessor_count,
++                                               cudaStream_t stream) {
++    require_shape9(a_weight, "a_weight");
++    require_shape9(b_weight, "b_weight");
++    return launch_bf16_prefill_mma<Bf16Gdn9Geometry, 16, 8>(
++        variant, x, nullptr, 0.0F, nullptr, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
++        stream, multiprocessor_count);
++}
++
++bool bf16_gdn_gating_proj_9_mma_split8_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
++                                              const Weight& a_weight, const Weight& b_weight,
++                                              const Tensor& A_log, const Tensor& dt_bias,
++                                              void* workspace, Tensor& g, Tensor& beta,
++                                              std::int32_t multiprocessor_count,
++                                              cudaStream_t stream) {
++    require_shape9(a_weight, "a_weight");
++    require_shape9(b_weight, "b_weight");
++    return launch_bf16_prefill_mma<Bf16Gdn9Geometry, 8, 8>(
++        variant, x, nullptr, 0.0F, nullptr, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
++        stream, multiprocessor_count);
++}
++
++bool bf16_gdn_gating_proj_9_mma_split4_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
++                                              const Weight& a_weight, const Weight& b_weight,
++                                              const Tensor& A_log, const Tensor& dt_bias,
++                                              void* workspace, Tensor& g, Tensor& beta,
++                                              std::int32_t multiprocessor_count,
++                                              cudaStream_t stream) {
++    require_shape9(a_weight, "a_weight");
++    require_shape9(b_weight, "b_weight");
++    return launch_bf16_prefill_mma<Bf16Gdn9Geometry, 4, 8>(
++        variant, x, nullptr, 0.0F, nullptr, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
++        stream, multiprocessor_count);
++}
++
++bool bf16_gdn_gating_proj_9_mma_split2_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
++                                              const Weight& a_weight, const Weight& b_weight,
++                                              const Tensor& A_log, const Tensor& dt_bias,
++                                              void* workspace, Tensor& g, Tensor& beta,
++                                              std::int32_t multiprocessor_count,
++                                              cudaStream_t stream) {
++    require_shape9(a_weight, "a_weight");
++    require_shape9(b_weight, "b_weight");
++    return launch_bf16_prefill_mma<Bf16Gdn9Geometry, 2, 8>(
++        variant, x, nullptr, 0.0F, nullptr, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
++        stream, multiprocessor_count);
++}
++
++void bf16_gdn_gating_proj_9_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
++                                               const Weight& a_weight, const Weight& b_weight,
++                                               const Tensor& A_log, const Tensor& dt_bias,
++                                               Tensor& g, Tensor& beta, cudaStream_t stream) {
++    require_shape9(a_weight, "a_weight");
++    require_shape9(b_weight, "b_weight");
++    (void)launch_bf16_prefill_mma<Bf16Gdn9Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr,
++                                                          a_weight, b_weight, A_log, dt_bias,
++                                                          nullptr, g, beta, stream);
++}
++
+ std::int32_t bf16_gdn_gating_proj_mma_resident_ctas_per_sm(bool geometry35,
+                                                            std::int32_t split_k) noexcept {
+     if (geometry35) {
+diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h
+index 73d57fda..28bca7a3 100644
+--- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h
++++ b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h
+@@ -94,4 +94,25 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
+                                                 const Tensor& A_log, const Tensor& dt_bias,
+                                                 Tensor& g, Tensor& beta, cudaStream_t stream);
+ 
++[[nodiscard]] bool bf16_gdn_gating_proj_9_mma_split16_launch(
++    Bf16GdnGatingTokenVariant variant, const Tensor& x, const Weight& a_weight,
++    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, void* workspace, Tensor& g,
++    Tensor& beta, std::int32_t multiprocessor_count, cudaStream_t stream);
++[[nodiscard]] bool bf16_gdn_gating_proj_9_mma_split8_launch(
++    Bf16GdnGatingTokenVariant variant, const Tensor& x, const Weight& a_weight,
++    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, void* workspace, Tensor& g,
++    Tensor& beta, std::int32_t multiprocessor_count, cudaStream_t stream);
++[[nodiscard]] bool bf16_gdn_gating_proj_9_mma_split4_launch(
++    Bf16GdnGatingTokenVariant variant, const Tensor& x, const Weight& a_weight,
++    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, void* workspace, Tensor& g,
++    Tensor& beta, std::int32_t multiprocessor_count, cudaStream_t stream);
++[[nodiscard]] bool bf16_gdn_gating_proj_9_mma_split2_launch(
++    Bf16GdnGatingTokenVariant variant, const Tensor& x, const Weight& a_weight,
++    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, void* workspace, Tensor& g,
++    Tensor& beta, std::int32_t multiprocessor_count, cudaStream_t stream);
++void bf16_gdn_gating_proj_9_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
++                                               const Weight& a_weight, const Weight& b_weight,
++                                               const Tensor& A_log, const Tensor& dt_bias,
++                                               Tensor& g, Tensor& beta, cudaStream_t stream);
++
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
+index da182554..f7fda44f 100644
+--- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
++++ b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
+@@ -188,6 +188,10 @@ bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
+     return problem.heads == 32 && problem.input_rows == 2048;
+ }
+ 
++bool is_9(const Bf16GdnGatingProblem& problem) noexcept {
++    return problem.heads == 32 && problem.input_rows == 4096;
++}
++
+ bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
+     switch (schedule) {
+     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
+@@ -207,7 +211,7 @@ bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
+ }
+ 
+ std::int32_t mma_tile_cols(const Bf16GdnGatingProblem& problem) noexcept {
+-    return is_35(problem) ? 64 : 128;
++    return (is_35(problem) || is_9(problem)) ? 64 : 128;
+ }
+ 
+ std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
+@@ -284,6 +288,25 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingPro
+             return false;
+         }
+     }
++    if (is_9(problem)) {
++        // The 9B geometry shares the 32-head BN64 residency profile of the 35B routes,
++        // but its input rows are twice as wide and it has no fused norm or small-T lane.
++        switch (schedule) {
++        case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
++        case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
++        case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
++        case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
++            return cooperative_35_grid_is_resident(schedule, problem.cols, sm_count);
++        case Bf16GdnGatingScheduleId::MmaUnsplit:
++            return true;
++        case Bf16GdnGatingScheduleId::GemvPairedRows:
++        case Bf16GdnGatingScheduleId::SmallTSplit10:
++        case Bf16GdnGatingScheduleId::SimtWarpRowC4:
++        case Bf16GdnGatingScheduleId::SimtWarpRowC8:
++        case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
++            return false;
++        }
++    }
+ 
+     switch (schedule) {
+     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
+@@ -331,6 +354,9 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
+         if (is_35(problem)) {
+             bf16_gdn_gating_proj_35_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
+                                                        A_log, dt_bias, g, beta, execution.stream);
++        } else if (is_9(problem)) {
++            bf16_gdn_gating_proj_9_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
++                                                      A_log, dt_bias, g, beta, execution.stream);
+         } else {
+             bf16_gdn_gating_proj_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
+                                                     A_log, dt_bias, g, beta, execution.stream);
+@@ -368,15 +394,25 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
+             execution.multiprocessor_count, execution.stream));
+         return;
+     case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
+-        finish_cooperative(bf16_gdn_gating_proj_35_mma_split16_launch(
+-            plan.token_variant, x, a_weight, b_weight, A_log, dt_bias, scratch.data, g, beta,
+-            execution.multiprocessor_count, execution.stream));
++        if (is_9(problem)) {
++            finish_cooperative(bf16_gdn_gating_proj_9_mma_split16_launch(
++                plan.token_variant, x, a_weight, b_weight, A_log, dt_bias, scratch.data, g, beta,
++                execution.multiprocessor_count, execution.stream));
++        } else {
++            finish_cooperative(bf16_gdn_gating_proj_35_mma_split16_launch(
++                plan.token_variant, x, a_weight, b_weight, A_log, dt_bias, scratch.data, g, beta,
++                execution.multiprocessor_count, execution.stream));
++        }
+         return;
+     case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
+         if (is_35(problem)) {
+             finish_cooperative(bf16_gdn_gating_proj_35_mma_split8_launch(
+                 plan.token_variant, x, a_weight, b_weight, A_log, dt_bias, scratch.data, g, beta,
+                 execution.multiprocessor_count, execution.stream));
++        } else if (is_9(problem)) {
++            finish_cooperative(bf16_gdn_gating_proj_9_mma_split8_launch(
++                plan.token_variant, x, a_weight, b_weight, A_log, dt_bias, scratch.data, g, beta,
++                execution.multiprocessor_count, execution.stream));
+         } else {
+             finish_cooperative(bf16_gdn_gating_proj_mma_split8_launch(
+                 plan.token_variant, x, a_weight, b_weight, A_log, dt_bias, scratch.data, g, beta,
+@@ -388,6 +424,10 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
+             finish_cooperative(bf16_gdn_gating_proj_35_mma_split4_launch(
+                 plan.token_variant, x, a_weight, b_weight, A_log, dt_bias, scratch.data, g, beta,
+                 execution.multiprocessor_count, execution.stream));
++        } else if (is_9(problem)) {
++            finish_cooperative(bf16_gdn_gating_proj_9_mma_split4_launch(
++                plan.token_variant, x, a_weight, b_weight, A_log, dt_bias, scratch.data, g, beta,
++                execution.multiprocessor_count, execution.stream));
+         } else {
+             finish_cooperative(bf16_gdn_gating_proj_mma_split4_launch(
+                 plan.token_variant, x, a_weight, b_weight, A_log, dt_bias, scratch.data, g, beta,
+@@ -399,6 +439,10 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
+             finish_cooperative(bf16_gdn_gating_proj_35_mma_split2_launch(
+                 plan.token_variant, x, a_weight, b_weight, A_log, dt_bias, scratch.data, g, beta,
+                 execution.multiprocessor_count, execution.stream));
++        } else if (is_9(problem)) {
++            finish_cooperative(bf16_gdn_gating_proj_9_mma_split2_launch(
++                plan.token_variant, x, a_weight, b_weight, A_log, dt_bias, scratch.data, g, beta,
++                execution.multiprocessor_count, execution.stream));
+         } else {
+             finish_cooperative(bf16_gdn_gating_proj_mma_split2_launch(
+                 plan.token_variant, x, a_weight, b_weight, A_log, dt_bias, scratch.data, g, beta,
+@@ -468,7 +512,7 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
+ 
+ bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
+     if (problem.cols < 1) { return false; }
+-    return is_27(problem) || is_35(problem);
++    return is_27(problem) || is_35(problem) || is_9(problem);
+ }
+ 
+ Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
+diff --git a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
+index 37264b19..a87c96bb 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
++++ b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
+@@ -330,12 +330,13 @@ struct SmallTTileWorkspace {
+ // The partials and per-tile metadata of the parallel query tiles over `width` columns.
+ template <class Allocator>
+ SmallTTileWorkspace allocate_small_t_tile_workspace(Allocator& workspace, std::int32_t q_heads,
+-                                                    std::int32_t width, std::int32_t tile_width,
++                                                    std::int32_t kv_heads, std::int32_t width,
++                                                    std::int32_t tile_width,
+                                                     KvCacheStorage storage,
+                                                     CausalAttentionExecutionEnvelope envelope) {
+     const std::int32_t tiles  = width / tile_width;
+-    const std::int32_t splits = detail::causal_attention_split_capacity(q_heads, tile_width,
+-                                                                        storage, envelope, tiles);
++    const std::int32_t splits = detail::causal_attention_split_capacity(
++        q_heads, kv_heads, tile_width, storage, envelope, tiles);
+     SmallTWorkspace partial =
+         allocate_small_t_workspace(workspace, q_heads, tile_width, splits, tiles);
+     Tensor valid = workspace.alloc(DType::I32, {tiles});
+@@ -345,8 +346,9 @@ SmallTTileWorkspace allocate_small_t_tile_workspace(Allocator& workspace, std::i
+ 
+ template <typename Launch>
+ void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceArena& workspace,
+-                            KvCacheStorage cache_storage, CausalAttentionExecutionEnvelope envelope,
+-                            Tensor& out, Launch&& launch) {
++                            std::int32_t kv_heads, KvCacheStorage cache_storage,
++                            CausalAttentionExecutionEnvelope envelope, Tensor& out,
++                            Launch&& launch) {
+     for (std::int32_t begin = 0; begin < q.ne[2];
+          begin +=
+          causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope)) {
+@@ -354,8 +356,8 @@ void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceA
+             causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope),
+             q.ne[2] - begin);
+         auto chunk_scope = workspace.scope();
+-        const std::int32_t splits =
+-            detail::causal_attention_split_capacity(q.ne[1], count, cache_storage, envelope);
++        const std::int32_t splits = detail::causal_attention_split_capacity(
++            q.ne[1], kv_heads, count, cache_storage, envelope);
+         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], count, splits, 1);
+         Tensor q_chunk          = q.slice(2, begin, count);
+         Tensor position_chunk   = positions.slice(0, begin, count);
+@@ -379,7 +381,7 @@ bool launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
+                                              stream);
+         auto tile_scope = workspace.scope();
+         SmallTTileWorkspace tiles = allocate_small_t_tile_workspace(
+-            workspace, q.ne[1], q.ne[2], tile, cache.storage, envelope);
++            workspace, q.ne[1], cache.num_kv_heads, q.ne[2], tile, cache.storage, envelope);
+         detail::causal_attention_small_t_tiles_launch(
+             q, positions, valid_columns.data == nullptr ? nullptr : &valid_columns, &table_rows,
+             scale, cache, envelope, tile, tiles.valid, tiles.rows, tiles.partial.acc,
+@@ -394,7 +396,7 @@ bool launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
+                                              q.ne[2] - begin);
+         auto chunk_scope          = workspace.scope();
+         const std::int32_t splits = detail::causal_attention_split_capacity(
+-            q.ne[1], count, cache.storage, envelope, q.ne[3]);
++            q.ne[1], cache.num_kv_heads, count, cache.storage, envelope, q.ne[3]);
+         SmallTWorkspace partial =
+             allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
+         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows,
+@@ -414,7 +416,7 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
+         tile > 0) {
+         auto tile_scope = workspace.scope();
+         SmallTTileWorkspace tiles = allocate_small_t_tile_workspace(
+-            workspace, q.ne[1], q.ne[2], tile, cache.storage, envelope);
++            workspace, q.ne[1], cache.num_kv_heads, q.ne[2], tile, cache.storage, envelope);
+         detail::causal_attention_small_t_tiles_launch(
+             q, positions, nullptr, nullptr, scale, single_row_paged_kv_batch_view(cache), envelope,
+             tile, tiles.valid, tiles.rows, tiles.partial.acc, tiles.partial.m, tiles.partial.l,
+@@ -422,7 +424,7 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
+         return;
+     }
+     for_each_small_t_chunk(
+-        q, positions, workspace, cache.storage, envelope, out,
++        q, positions, workspace, cache.num_kv_heads, cache.storage, envelope, out,
+         [&](std::int32_t, std::int32_t, const Tensor& q_chunk, const Tensor& position_chunk,
+             SmallTWorkspace& partial, Tensor& out_chunk) {
+             detail::causal_attention_cached_small_t_launch(q_chunk, position_chunk, scale, cache,
+@@ -653,7 +655,7 @@ static std::size_t workspace_capacity_bytes(AttentionHeadGeometry geometry,
+ 
+     const auto chunk_capacity = [&](std::int32_t width) {
+         const std::int32_t splits = detail::causal_attention_split_capacity(
+-            q_heads, width, cache_storage, envelope, batch_size);
++            q_heads, geometry.kv_heads, width, cache_storage, envelope, batch_size);
+         WorkspaceLayoutBuilder layout;
+         (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size);
+         return layout.peak_bytes(1);
+@@ -668,8 +670,8 @@ static std::size_t workspace_capacity_bytes(AttentionHeadGeometry geometry,
+                 q_heads, width, batch_size, cache_storage);
+             tile > 0) {
+             WorkspaceLayoutBuilder layout;
+-            (void)allocate_small_t_tile_workspace(layout, q_heads, width, tile, cache_storage,
+-                                                  envelope);
++            (void)allocate_small_t_tile_workspace(layout, q_heads, geometry.kv_heads, width, tile,
++                                                  cache_storage, envelope);
+             return layout.peak_bytes(1);
+         }
+         for (std::int32_t begin = 0; begin < width;
+@@ -844,8 +846,8 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+         return;
+     }
+     if (route == detail::CausalAttentionRoute::SmallT) {
+-        const std::int32_t splits =
+-            detail::causal_attention_split_capacity(q.ne[1], width, cache.storage, envelope, batch);
++        const std::int32_t splits = detail::causal_attention_split_capacity(
++            q.ne[1], cache.num_kv_heads, width, cache.storage, envelope, batch);
+         SmallTWorkspace partial =
+             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
+         // Only the shared BF16/INT8-family reducer carries a gate; its epilogue rounds exactly as
+@@ -975,8 +977,8 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
+         return;
+     }
+     if (route == detail::CausalAttentionRoute::SmallT) {
+-        const std::int32_t splits =
+-            detail::causal_attention_split_capacity(q.ne[1], q.ne[2], cache.storage, envelope);
++        const std::int32_t splits = detail::causal_attention_split_capacity(
++            q.ne[1], cache.num_kv_heads, q.ne[2], cache.storage, envelope);
+         SmallTWorkspace partial =
+             allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits, 1);
+         detail::causal_attention_cached_small_t_launch(
+diff --git a/src/ops/softmax_attention/dense/causal_cache/fp8/prompt.cu b/src/ops/softmax_attention/dense/causal_cache/fp8/prompt.cu
+index 68498111..a3358090 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/fp8/prompt.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/fp8/prompt.cu
+@@ -129,7 +129,7 @@ void causal_attention_prompt_fp8_attention_dispatch(const Tensor& q, const Tenso
+                                                     std::uint32_t max_visible_keys,
+                                                     WorkspaceArena& workspace, Tensor& out,
+                                                     bool fast, cudaStream_t stream) {
+-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+         causal_attention_prompt_fp8_attention_launch_for<Geometry>(
+             q, positions, scale, cache, metadata, valid, max_visible_keys, workspace, out, fast,
+             stream);
+diff --git a/src/ops/softmax_attention/dense/causal_cache/fp8/small_t.cpp b/src/ops/softmax_attention/dense/causal_cache/fp8/small_t.cpp
+index 004a4248..c617f865 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/fp8/small_t.cpp
++++ b/src/ops/softmax_attention/dense/causal_cache/fp8/small_t.cpp
+@@ -27,8 +27,9 @@ void causal_attention_small_t_fp8_launch_for(const Tensor& q, CacheInput input,
+                                              Tensor& partial_acc, Tensor& partial_m,
+                                              Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+     const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
+-    const auto splits = causal_attention_split_capacity(q.ne[1], invocation.width, cache.storage,
+-                                                        envelope, invocation.batch_size);
++    const auto splits = causal_attention_split_capacity(
++        q.ne[1], cache.num_kv_heads, invocation.width, cache.storage, envelope,
++        invocation.batch_size);
+     const SmallTPartialLaunch partial =
+         small_t_partial_launch(q, positions, scale, cache, invocation, logical_capacity, splits,
+                                partial_acc, partial_m, partial_l, stream);
+@@ -73,7 +74,7 @@ void causal_attention_small_t_fp8_launch(
+         .partition     = causal_attention_key_partition(envelope, cache),
+         .partial_out   = partial_out,
+     };
+-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+         causal_attention_small_t_fp8_launch_for<Geometry>(q, input, positions, scale, cache,
+                                                           invocation, envelope, partial_acc,
+                                                           partial_m, partial_l, out, stream);
+@@ -97,7 +98,7 @@ void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& p
+         .batch_size    = 1,
+         .partition     = causal_attention_key_partition(envelope, batch_cache),
+     };
+-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+         causal_attention_small_t_fp8_launch_for<Geometry>(q, input, positions, scale, batch_cache,
+                                                           invocation, envelope, partial_acc,
+                                                           partial_m, partial_l, out, stream);
+diff --git a/src/ops/softmax_attention/dense/causal_cache/geometry.cuh b/src/ops/softmax_attention/dense/causal_cache/geometry.cuh
+index c0af840b..02c58aa7 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/geometry.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/geometry.cuh
+@@ -27,6 +27,7 @@ struct CausalAttentionGeometry {
+ 
+ using CausalD256H24Kv4 = CausalAttentionGeometry<6, 4, 1>;
+ using CausalD256H16Kv2 = CausalAttentionGeometry<8, 2, 2>;
++using CausalD256H16Kv4 = CausalAttentionGeometry<4, 4, 1>;
+ 
+ // Whether `query_heads` over `kv_heads` is one of those geometries or a run of its KV heads.
+ [[nodiscard]] constexpr bool causal_attention_geometry_supported(std::int32_t query_heads,
+@@ -34,7 +35,8 @@ using CausalD256H16Kv2 = CausalAttentionGeometry<8, 2, 2>;
+     if (kv_heads <= 0 || query_heads % kv_heads != 0) { return false; }
+     const std::int32_t group = query_heads / kv_heads;
+     return (group == CausalD256H24Kv4::GroupSize && kv_heads <= CausalD256H24Kv4::ModelKVHeads) ||
+-           (group == CausalD256H16Kv2::GroupSize && kv_heads <= CausalD256H16Kv2::ModelKVHeads);
++           (group == CausalD256H16Kv2::GroupSize && kv_heads <= CausalD256H16Kv2::ModelKVHeads) ||
++           (group == CausalD256H16Kv4::GroupSize && kv_heads <= CausalD256H16Kv4::ModelKVHeads);
+ }
+ 
+ // Calls `f.template operator()<Geometry>()` with the geometry of `query_heads` over `kv_heads`.
+@@ -47,11 +49,14 @@ decltype(auto) with_causal_geometry(std::int32_t query_heads, std::int32_t kv_he
+     if (query_heads / kv_heads == CausalD256H24Kv4::GroupSize) {
+         return f.template operator()<CausalD256H24Kv4>();
+     }
++    if (query_heads / kv_heads == CausalD256H16Kv4::GroupSize) {
++        return f.template operator()<CausalD256H16Kv4>();
++    }
+     return f.template operator()<CausalD256H16Kv2>();
+ }
+ 
+ // The same for a call named by its query heads alone. A call holds whole groups of query heads, and
+-// the geometries' counts (6, 12, 18 or 24, and 8 or 16) do not overlap.
++// the geometries' counts (6, 12, 18 or 24, and 4, 8 or 16) do not overlap.
+ template <typename F>
+ decltype(auto) with_causal_query_geometry(std::int32_t query_heads, F&& f) {
+     const std::int32_t group = query_heads % CausalD256H24Kv4::GroupSize == 0
+@@ -60,6 +65,12 @@ decltype(auto) with_causal_query_geometry(std::int32_t query_heads, F&& f) {
+     return with_causal_geometry(query_heads, query_heads / group, static_cast<F&&>(f));
+ }
+ 
++// A call whose query-head count is shared by two geometries must name its KV heads.
++template <typename F>
++decltype(auto) with_causal_query_geometry(std::int32_t query_heads, std::int32_t kv_heads, F&& f) {
++    return with_causal_geometry(query_heads, kv_heads, static_cast<F&&>(f));
++}
++
+ // The query heads of the model whose geometry a call with `query_heads` takes: a tensor-parallel
+ // share takes its model's measured routes, chunks and tiles.
+ [[nodiscard]] inline std::int32_t causal_attention_model_query_heads(std::int32_t query_heads) {
+diff --git a/src/ops/softmax_attention/dense/causal_cache/int8/small_t_dispatch.cpp b/src/ops/softmax_attention/dense/causal_cache/int8/small_t_dispatch.cpp
+index 052655bc..67369a11 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/int8/small_t_dispatch.cpp
++++ b/src/ops/softmax_attention/dense/causal_cache/int8/small_t_dispatch.cpp
+@@ -207,6 +207,8 @@ void small_t_i8_load_modules(std::int32_t last) {
+     template void small_t_i8_load_modules<GEOMETRY, INPUT>(std::int32_t);
+ NINFER_SMALL_T_I8_DISPATCH(CausalD256H24Kv4, CausalAppendInput)
+ NINFER_SMALL_T_I8_DISPATCH(CausalD256H24Kv4, CausalCachedInput)
++NINFER_SMALL_T_I8_DISPATCH(CausalD256H16Kv4, CausalAppendInput)
++NINFER_SMALL_T_I8_DISPATCH(CausalD256H16Kv4, CausalCachedInput)
+ NINFER_SMALL_T_I8_DISPATCH(CausalD256H16Kv2, CausalAppendInput)
+ NINFER_SMALL_T_I8_DISPATCH(CausalD256H16Kv2, CausalCachedInput)
+ #undef NINFER_SMALL_T_I8_DISPATCH
+diff --git a/src/ops/softmax_attention/dense/causal_cache/k8v4/prompt.cu b/src/ops/softmax_attention/dense/causal_cache/k8v4/prompt.cu
+index 7aeef457..609573e3 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/k8v4/prompt.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/k8v4/prompt.cu
+@@ -44,7 +44,7 @@ void causal_attention_prompt_k8v4_attention_dispatch(const Tensor& q, const Tens
+                                                      float scale, const CacheView& cache,
+                                                      Metadata metadata, Tensor& out,
+                                                      cudaStream_t stream) {
+-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+         causal_attention_prompt_k8v4_attention_launch_for<Geometry>(q, positions, scale, cache,
+                                                                     metadata, out, stream);
+     });
+diff --git a/src/ops/softmax_attention/dense/causal_cache/k8v4/small_t.cpp b/src/ops/softmax_attention/dense/causal_cache/k8v4/small_t.cpp
+index 76b9dd80..25be404f 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/k8v4/small_t.cpp
++++ b/src/ops/softmax_attention/dense/causal_cache/k8v4/small_t.cpp
+@@ -27,8 +27,9 @@ void causal_attention_small_t_k8v4_launch_for(const Tensor& q, CacheInput input,
+                                              Tensor& partial_acc, Tensor& partial_m,
+                                              Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+     const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
+-    const auto splits = causal_attention_split_capacity(q.ne[1], invocation.width, cache.storage,
+-                                                        envelope, invocation.batch_size);
++    const auto splits = causal_attention_split_capacity(
++        q.ne[1], cache.num_kv_heads, invocation.width, cache.storage, envelope,
++        invocation.batch_size);
+     const SmallTPartialLaunch partial =
+         small_t_partial_launch(q, positions, scale, cache, invocation, logical_capacity, splits,
+                                partial_acc, partial_m, partial_l, stream);
+@@ -73,7 +74,7 @@ void causal_attention_small_t_k8v4_launch(
+         .partition     = causal_attention_key_partition(envelope, cache),
+         .partial_out   = partial_out,
+     };
+-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+         causal_attention_small_t_k8v4_launch_for<Geometry>(q, input, positions, scale, cache,
+                                                            invocation, envelope, partial_acc,
+                                                            partial_m, partial_l, out, stream);
+@@ -97,7 +98,7 @@ void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor&
+         .batch_size    = 1,
+         .partition     = causal_attention_key_partition(envelope, batch_cache),
+     };
+-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+         causal_attention_small_t_k8v4_launch_for<Geometry>(q, input, positions, scale, batch_cache,
+                                                            invocation, envelope, partial_acc,
+                                                            partial_m, partial_l, out, stream);
+diff --git a/src/ops/softmax_attention/dense/causal_cache/nvfp4/prompt.cu b/src/ops/softmax_attention/dense/causal_cache/nvfp4/prompt.cu
+index 1766ad99..281ea967 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/nvfp4/prompt.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/nvfp4/prompt.cu
+@@ -44,7 +44,7 @@ void causal_attention_prompt_nvfp4_attention_dispatch(const Tensor& q, const Ten
+                                                       float scale, const CacheView& cache,
+                                                       Metadata metadata, Tensor& out,
+                                                       cudaStream_t stream) {
+-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+         causal_attention_prompt_nvfp4_attention_launch_for<Geometry>(q, positions, scale, cache,
+                                                                      metadata, out, stream);
+     });
+diff --git a/src/ops/softmax_attention/dense/causal_cache/nvfp4/prompt_fast.cu b/src/ops/softmax_attention/dense/causal_cache/nvfp4/prompt_fast.cu
+index 0480c61b..0720264e 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/nvfp4/prompt_fast.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/nvfp4/prompt_fast.cu
+@@ -100,7 +100,7 @@ void causal_attention_prompt_nvfp4_fast_launch(const Tensor& q, const Tensor& po
+                                                std::uint32_t max_visible_keys,
+                                                WorkspaceArena& workspace, Tensor& out,
+                                                cudaStream_t stream) {
+-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+         launch_fast_for<Geometry>(q, positions, valid_columns, table_rows, scale, cache,
+                                   max_visible_keys, workspace, out, stream);
+     });
+diff --git a/src/ops/softmax_attention/dense/causal_cache/nvfp4/small_t.cpp b/src/ops/softmax_attention/dense/causal_cache/nvfp4/small_t.cpp
+index ca8aaeed..fd201db3 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/nvfp4/small_t.cpp
++++ b/src/ops/softmax_attention/dense/causal_cache/nvfp4/small_t.cpp
+@@ -27,8 +27,9 @@ void causal_attention_small_t_nvfp4_launch_for(const Tensor& q, CacheInput input
+                                              Tensor& partial_acc, Tensor& partial_m,
+                                              Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+     const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
+-    const auto splits = causal_attention_split_capacity(q.ne[1], invocation.width, cache.storage,
+-                                                        envelope, invocation.batch_size);
++    const auto splits = causal_attention_split_capacity(
++        q.ne[1], cache.num_kv_heads, invocation.width, cache.storage, envelope,
++        invocation.batch_size);
+     const SmallTPartialLaunch partial =
+         small_t_partial_launch(q, positions, scale, cache, invocation, logical_capacity, splits,
+                                partial_acc, partial_m, partial_l, stream);
+@@ -73,7 +74,7 @@ void causal_attention_small_t_nvfp4_launch(
+         .partition     = causal_attention_key_partition(envelope, cache),
+         .partial_out   = partial_out,
+     };
+-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+         causal_attention_small_t_nvfp4_launch_for<Geometry>(q, input, positions, scale, cache,
+                                                             invocation, envelope, partial_acc,
+                                                             partial_m, partial_l, out, stream);
+@@ -97,7 +98,7 @@ void causal_attention_cached_small_t_nvfp4_launch(const Tensor& q, const Tensor&
+         .batch_size    = 1,
+         .partition     = causal_attention_key_partition(envelope, batch_cache),
+     };
+-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+         causal_attention_small_t_nvfp4_launch_for<Geometry>(q, input, positions, scale, batch_cache,
+                                                             invocation, envelope, partial_acc,
+                                                             partial_m, partial_l, out, stream);
+diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt.cpp b/src/ops/softmax_attention/dense/causal_cache/prompt.cpp
+index d4ce1902..d84351c8 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/prompt.cpp
++++ b/src/ops/softmax_attention/dense/causal_cache/prompt.cpp
+@@ -206,7 +206,7 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
+     }
+     PromptLaunch launch = prompt_launch(q, positions, scale, cache, out, stream);
+     launch.tables       = static_cast<const std::int32_t*>(cache.block_table.data);
+-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+         causal_attention_prompt_attention_launch_for<Geometry, PromptMetadataForm::Direct>(
+             cache, launch, max_visible_keys, workspace, fast);
+     });
+@@ -239,7 +239,7 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
+     launch.table_rows   = static_cast<const std::int32_t*>(table_rows.data);
+     launch.table_stride = cache.block_tables.ne[0];
+     const auto attend   = [&]<PromptMetadataForm Form>() {
+-        with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++        with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+             causal_attention_prompt_attention_launch_for<Geometry, Form>(cache, launch,
+                                                                          max_visible_keys,
+                                                                          workspace, fast);
+diff --git a/src/ops/softmax_attention/dense/causal_cache/route.h b/src/ops/softmax_attention/dense/causal_cache/route.h
+index 2935c8a3..d2681b04 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/route.h
++++ b/src/ops/softmax_attention/dense/causal_cache/route.h
+@@ -13,7 +13,8 @@ namespace ninfer::ops::detail {
+ 
+ enum class CausalAttentionRoute { SmallT, ChunkedSmallT, Prompt };
+ 
+-std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
++std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t kv_heads,
++                                             std::int32_t tokens,
+                                              KvCacheStorage cache_storage,
+                                              CausalAttentionExecutionEnvelope envelope,
+                                              std::int32_t batch_size = 1);
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t.cpp b/src/ops/softmax_attention/dense/causal_cache/small_t.cpp
+index 3b3fac34..0a0382e1 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t.cpp
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t.cpp
+@@ -184,12 +184,12 @@ causal_small_t_wave_capacity(std::int32_t capacity, std::int32_t kv_heads, std::
+ 
+ } // namespace
+ 
+-std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
++std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t kv_heads,
++                                             std::int32_t tokens,
+                                              KvCacheStorage cache_storage,
+                                              CausalAttentionExecutionEnvelope envelope,
+                                              std::int32_t batch_size) {
+-    return with_causal_query_geometry(q_heads, [&]<typename Geometry>() -> std::int32_t {
+-        const std::int32_t kv_heads = q_heads / Geometry::GroupSize;
++    return with_causal_geometry(q_heads, kv_heads, [&]<typename Geometry>() -> std::int32_t {
+         if (tokens < 1 || tokens > (Geometry::GroupSize == 6 ? 8 : 6) ||
+             envelope.min_visible_keys == 0 ||
+             envelope.min_visible_keys > envelope.max_visible_keys) {
+@@ -252,7 +252,8 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
+                                          const void* gate = nullptr) {
+     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
+     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
+-    const auto splits    = causal_attention_split_capacity(q.ne[1], invocation.width, cache.storage,
++    const auto splits    = causal_attention_split_capacity(q.ne[1], cache.num_kv_heads,
++                                                           invocation.width, cache.storage,
+                                                            envelope, invocation.batch_size);
+     const bool i8_family = kv_cache_is_int8_family(cache.storage);
+     const std::int32_t wave_splits =
+@@ -346,7 +347,7 @@ void causal_attention_small_t_launch(const Tensor& q, const Tensor& k, const Ten
+         // The call's rows were appended before it (causal_softmax_attention).
+         const CausalPackedInput input{static_cast<const std::uint8_t*>(cache.k_scale_pages.data),
+                                       static_cast<const std::uint8_t*>(cache.v_scale_pages.data)};
+-        with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++        with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+             causal_attention_small_t_launch_for<Geometry>(q, input, pos, scale, cache, invocation,
+                                                           envelope, partial_acc, partial_m,
+                                                           partial_l, out, stream, gate);
+@@ -355,7 +356,7 @@ void causal_attention_small_t_launch(const Tensor& q, const Tensor& k, const Ten
+     }
+     const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
+                                   static_cast<const __nv_bfloat16*>(v.data)};
+-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+         causal_attention_small_t_launch_for<Geometry>(q, input, pos, scale, cache, invocation,
+                                                       envelope, partial_acc, partial_m, partial_l,
+                                                       out, stream, gate);
+@@ -393,7 +394,7 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos,
+         .partition     = causal_attention_key_partition(envelope, batch_cache),
+     };
+     const auto launch = [&](auto input) {
+-        with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++        with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+             causal_attention_small_t_launch_for<Geometry>(q, input, pos, scale, batch_cache,
+                                                           invocation, envelope, partial_acc,
+                                                           partial_m, partial_l, out, stream);
+@@ -482,7 +483,7 @@ void causal_attention_small_t_tiles_launch(const Tensor& q, const Tensor& positi
+         .partial_out   = partial_out,
+     };
+     const CausalCachedInput input{};
+-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
++    with_causal_query_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+         causal_attention_small_t_launch_for<Geometry>(q, input, positions, scale, cache, invocation,
+                                                       envelope, partial_acc, partial_m, partial_l,
+                                                       out, stream, gate);
+diff --git a/src/ops/softmax_attention/sources.cmake b/src/ops/softmax_attention/sources.cmake
+index 1cfb274f..ac441d1d 100644
+--- a/src/ops/softmax_attention/sources.cmake
++++ b/src/ops/softmax_attention/sources.cmake
+@@ -92,11 +92,15 @@ if(NINFER_ARCH_TURING OR NINFER_ARCH_AMPERE OR NINFER_ARCH_BLACKWELL)
+ else()
+   set(_ninfer_small_t_post_volta OFF)
+ endif()
+-foreach(_ninfer_small_t_geometry IN ITEMS h24 h16)
++foreach(_ninfer_small_t_geometry IN ITEMS h24 h16kv4 h16)
+   if(_ninfer_small_t_geometry STREQUAL h24)
+     set(_ninfer_small_t_type CausalD256H24Kv4)
+     set(_ninfer_small_t_group 6)
+     set(_ninfer_small_t_widest 8)
++  elseif(_ninfer_small_t_geometry STREQUAL h16kv4)
++    set(_ninfer_small_t_type CausalD256H16Kv4)
++    set(_ninfer_small_t_group 4)
++    set(_ninfer_small_t_widest 6)
+   else()
+     set(_ninfer_small_t_type CausalD256H16Kv2)
+     set(_ninfer_small_t_group 8)
+diff --git a/src/ops/weight_input.cpp b/src/ops/weight_input.cpp
+index 58e49dac..a3dca12a 100644
+--- a/src/ops/weight_input.cpp
++++ b/src/ops/weight_input.cpp
+@@ -292,7 +292,8 @@ ProjectionWeights prepare_gdn_input_proj_weights(const WeightInput& query, const
+ ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const WeightInput& b) {
+     const auto& shape = matrix(a);
+     require(shape == matrix(b) && (shape == std::vector<std::uint64_t>{48, 5120} ||
+-                                   shape == std::vector<std::uint64_t>{32, 2048}),
++                                   shape == std::vector<std::uint64_t>{32, 2048} ||
++                                   shape == std::vector<std::uint64_t>{32, 4096}),
+             "GDN control: unsupported A/B geometry");
+     const std::array inputs{a, b};
+     if (contiguous(concatenate_rows(inputs))) {
+@@ -300,7 +301,8 @@ ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const We
+         require(result.weight.qtype == QType::BF16, "GDN control requires BF16 weights");
+         return result;
+     }
+-    require(shape[0] == 48, "GDN control: this geometry requires a combined parent");
++    require(shape[0] == 48 || shape[0] == 32,
++            "GDN control: this geometry requires a combined parent");
+     const auto first  = prepare_linear_weight(a);
+     const auto second = prepare_linear_weight(b);
+     require(first.weight.qtype == QType::BF16 && second.weight.qtype == QType::BF16,
+diff --git a/src/ops/wrapper/gdn_gating_proj.cpp b/src/ops/wrapper/gdn_gating_proj.cpp
+index 328e5347..d51a7e5b 100644
+--- a/src/ops/wrapper/gdn_gating_proj.cpp
++++ b/src/ops/wrapper/gdn_gating_proj.cpp
+@@ -58,9 +58,32 @@ GdnControlParentGeometry require_bf16_parent(const Weight& parent) {
+         require_bf16_weight(parent, 64, 2048, "ab_weight");
+         return {.input_rows = 2048, .heads = 32};
+     }
++    if (parent.n == 64 && parent.k == 4096) {
++        require_bf16_weight(parent, 64, 4096, "ab_weight");
++        return {.input_rows = 4096, .heads = 32};
++    }
+     throw std::invalid_argument("gdn_gating_proj: unsupported ab_weight geometry");
+ }
+ 
++GdnControlParentGeometry require_bf16_control(const Weight& a, const Weight& b) {
++    if (a.n == 48 && a.k == 5120) {
++        require_bf16_weight(a, 48, 5120, "a_weight");
++        require_bf16_weight(b, 48, 5120, "b_weight");
++        return {.input_rows = 5120, .heads = 48};
++    }
++    if (a.n == 32 && a.k == 2048) {
++        require_bf16_weight(a, 32, 2048, "a_weight");
++        require_bf16_weight(b, 32, 2048, "b_weight");
++        return {.input_rows = 2048, .heads = 32};
++    }
++    if (a.n == 32 && a.k == 4096) {
++        require_bf16_weight(a, 32, 4096, "a_weight");
++        require_bf16_weight(b, 32, 4096, "b_weight");
++        return {.input_rows = 4096, .heads = 32};
++    }
++    throw std::invalid_argument("gdn_gating_proj: unsupported A/B geometry");
++}
++
+ void require_vector_tensor(const Tensor& t, DType dtype, std::int32_t n0, const char* op,
+                            const char* name) {
+     if (t.dtype != dtype || t.ne[0] != n0 || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1 ||
+@@ -106,13 +129,12 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
+                      Tensor& beta, DeviceExecutionView execution) {
+     constexpr const char* op  = "gdn_gating_proj";
+     const std::int32_t tokens = x.ne[1];
+-    require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
+-    require_vector_tensor(A_log, DType::FP32, 48, op, "A_log");
+-    require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
+-    require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
+-    require_sequence_tensor(beta, DType::FP32, 48, tokens, op, "beta");
+-    require_bf16_weight(a_weight, 48, 5120, "a_weight");
+-    require_bf16_weight(b_weight, 48, 5120, "b_weight");
++    const GdnControlParentGeometry geometry = require_bf16_control(a_weight, b_weight);
++    require_sequence_tensor(x, DType::BF16, geometry.input_rows, tokens, op, "x");
++    require_vector_tensor(A_log, DType::FP32, geometry.heads, op, "A_log");
++    require_vector_tensor(dt_bias, DType::FP32, geometry.heads, op, "dt_bias");
++    require_sequence_tensor(g, DType::FP32, geometry.heads, tokens, op, "g");
++    require_sequence_tensor(beta, DType::FP32, geometry.heads, tokens, op, "beta");
+     require_execution(execution, op);
+ 
+     detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, execution);
+@@ -145,15 +167,14 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
+     if (!(eps > 0.0F) || !std::isfinite(eps)) {
+         throw std::invalid_argument("gdn_norm_gating_proj: eps must be positive and finite");
+     }
+-    require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
+-    require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");
+-    require_sequence_tensor(h, DType::BF16, 5120, tokens, op, "h");
+-    require_vector_tensor(A_log, DType::FP32, 48, op, "A_log");
+-    require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
+-    require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
+-    require_sequence_tensor(beta, DType::FP32, 48, tokens, op, "beta");
+-    require_bf16_weight(a_weight, 48, 5120, "a_weight");
+-    require_bf16_weight(b_weight, 48, 5120, "b_weight");
++    const GdnControlParentGeometry geometry = require_bf16_control(a_weight, b_weight);
++    require_sequence_tensor(x, DType::BF16, geometry.input_rows, tokens, op, "x");
++    require_vector_tensor(norm_weight, DType::BF16, geometry.input_rows, op, "norm_weight");
++    require_sequence_tensor(h, DType::BF16, geometry.input_rows, tokens, op, "h");
++    require_vector_tensor(A_log, DType::FP32, geometry.heads, op, "A_log");
++    require_vector_tensor(dt_bias, DType::FP32, geometry.heads, op, "dt_bias");
++    require_sequence_tensor(g, DType::FP32, geometry.heads, tokens, op, "g");
++    require_sequence_tensor(beta, DType::FP32, geometry.heads, tokens, op, "beta");
+     require_execution(execution, op);
+ 
+     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
+diff --git a/tools/convert/gguf_blocks.py b/tools/convert/gguf_blocks.py
+index f5803750..62ba8e19 100644
+--- a/tools/convert/gguf_blocks.py
++++ b/tools/convert/gguf_blocks.py
+@@ -70,7 +70,7 @@ from .ternary import (
+ 
+ MTP_BLOCK = LAYERS
+ # The storage the GDN controls may have (gdn_control_source).
+-GDN_CONTROL_TYPES = ("BF16", "Q8_0")
++GDN_CONTROL_TYPES = ("blocks",)
+ # The storage the output head may have: stored blocks, or BF16 words (bf16_source).
+ HEAD_TYPES = ("blocks", "BF16")
+ 
+@@ -577,9 +577,9 @@ def head_source(gguf: GGUFFile) -> tuple[LogicalSource, bool]:
+ 
+ def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
+     """A GDN A/B control as its BF16 operand, its value heads in the grouped order: BF16 words
+-    as stored, Q8_0 values rounded to BF16."""
++    as stored, encoded values rounded to BF16."""
+ 
+-    if gguf.info(tensor).type_id == GGML_Q8_0:
++    if gguf.info(tensor).type_id != TYPE_BF16:
+         values = untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1)
+         return array_source(
+             torch.from_numpy(np.ascontiguousarray(values)).to(torch.bfloat16), tensor
+-- 
+2.56.1

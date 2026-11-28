@@ -2,13 +2,14 @@
 
 Prebuilt **Linux x64** [NInfer-all](https://github.com/iamwavecut/ninfer-all) CLI (`sm_86` focus) for people who do not want to compile CUDA kernels.
 
-This build is based on upstream `ninfer-all` [`2caa901`](https://github.com/iamwavecut/ninfer-all/commit/2caa90160c736b4a5d3d39b8f05a92b31abe20ca) (`master`, 2026-11-24) merged with upstream [PR #468](https://github.com/iamwavecut/ninfer-all/pull/468) (`f84786d`, Ternary Bonsai 2.5 27B `gguf_ptq1_0` + `t2_g128_fp16` + PrismML MTP & Vision) plus [`patches/0002-t5-prism-compat.patch`](patches/0002-t5-prism-compat.patch) (`ninfer --version` prints `ninfer 2026-11-24.7+2026-11-24.7-6-g79d608ae (nvcc 13.5.37, 86)`).
+This build is based on upstream `ninfer-all` [`2caa901`](https://github.com/iamwavecut/ninfer-all/commit/2caa90160c736b4a5d3d39b8f05a92b31abe20ca) (`master`, 2026-11-24) merged with upstream [PR #468](https://github.com/iamwavecut/ninfer-all/pull/468) (`f84786d`, Ternary Bonsai 2.5 27B `gguf_ptq1_0` + `t2_g128_fp16` + PrismML MTP & Vision) plus [`patches/0002-t5-prism-compat.patch`](patches/0002-t5-prism-compat.patch) and [`patches/0003-qwen35-9b-geometry.patch`](patches/0003-qwen35-9b-geometry.patch) (`ninfer --version` prints `ninfer 2026-11-24.7+2026-11-24.7-6-g79d608ae-dirty (nvcc 13.5.37, 86)`).
 
 The old `--video-fps` test patch (`patches/0001-video-fps.patch`) is **not** applied in this release; video sampling uses upstream's 2 fps default.
 
 ## Highlights in this release
 
 - **Single `sm_86` engine for all `ninfer-all` models:** Qwen3.5 / 3.6 / 3.8 (dense, MoE, Flash-Next), Gemma 4, Inkling 2 Mini (+ `--spec dflash2`), DeepSeek-V4.1-Flash, Flint, Edge0.
+- **Qwen3.5 9B geometry support:** [`patches/0003-qwen35-9b-geometry.patch`](patches/0003-qwen35-9b-geometry.patch) adds `Bf16Gdn9Geometry` (`[32, 4096]` GDN gating projections), `CausalD256H16Kv4` (`16` query / `4` KV head causal softmax attention), and generalized non-BF16 encoded `gdn_control_source` conversion in `tools/convert/gguf_blocks.py`.
 - **Ternary Bonsai 2 & 2.5 27B (both artifact lines):**
   - Upstream `ninfer-all` format: `t2_g128_fp16` (`PQ2_0`) and `gguf_ptq1_0` (`PTQ1_0` from PR #468) with MTP / DFlash2 / Vision.
   - Community / `jgamboa` `t5_g128_fp16` format: [`patches/0002-t5-prism-compat.patch`](patches/0002-t5-prism-compat.patch) adds `t5_g128_fp16` / `ternary_row_k128_v1` + `prism_hadamard` parsing and losslessly transcodes `t5_g128_fp16` to `t2_g128_fp16` at load time, so `jgamboa/Ternary-Bonsai-2.5-27B-NInfer-4090` and `jgamboa/Ternary-Bonsai-2-27B-NInfer-4090` load directly on `sm_86` (with `--spec mtp --lm-head-draft --vision`).
@@ -85,6 +86,7 @@ git fetch origin master pull/468/head:pr-468
 git checkout -b sm86-bonsai25 2caa90160c736b4a5d3d39b8f05a92b31abe20ca
 git merge --no-edit pr-468
 git am /path/to/ninfer-linux/patches/0002-t5-prism-compat.patch
+git am /path/to/ninfer-linux/patches/0003-qwen35-9b-geometry.patch
 ./scripts/fetch-media-sources.sh
 
 export CC=/usr/bin/gcc-15 CXX=/usr/bin/g++-15 CUDACXX=/opt/cuda/bin/nvcc CUDAHOSTCXX=/usr/bin/g++-15
